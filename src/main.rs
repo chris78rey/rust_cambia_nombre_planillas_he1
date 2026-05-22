@@ -166,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
 
-            delete_sources(&files)?;
+            delete_sources(&files, &output)?;
             cleanup_aux(&aux_paths)?;
             if aux_dir.read_dir()?.next().is_none() {
                 fs::remove_dir_all(&aux_dir)?;
@@ -370,8 +370,14 @@ fn cleanup_aux(aux_paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn delete_sources(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+fn delete_sources(
+    files: &[PathBuf],
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     for path in files {
+        if path == output {
+            continue;
+        }
         if path.exists() {
             fs::remove_file(path)?;
             println!("  eliminado original: {}", path.display());
