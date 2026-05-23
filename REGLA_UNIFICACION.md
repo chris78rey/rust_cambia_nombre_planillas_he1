@@ -6,6 +6,7 @@ Este es el unico documento de ayuda del proyecto. Resume las reglas que aplica `
 
 - `he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>`
 - `he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>`
+- `he1-unificar-pdfs --report <etiqueta | ruta_respaldo_o_manifest.txt>`
 
 ## Entrada
 
@@ -27,6 +28,68 @@ Este es el unico documento de ayuda del proyecto. Resume las reglas que aplica `
 - El programa deja un `Cambios.txt` con el detalle de la ejecucion.
 - Si la entrada es una carpeta, el log queda en la raiz del proyecto.
 - Si la entrada es un `.txt`, el log queda en la raiz del proyecto.
+
+## Ejecucion con Docker Desktop
+
+Para probar el proceso en Linux sin VPS:
+
+1. Copia `.env.example` a `.env`.
+2. Ajusta `HOST_REPO` para que apunte al repo en tu equipo.
+3. Ajusta `HE1_MODE`:
+   - `process` para procesar
+   - `process_report` para procesar y luego generar el HTML en una sola corrida
+   - `restore` para revertir
+   - `report` para generar el HTML
+4. Usa `docker compose up --build`.
+
+Ejemplos:
+
+- Procesar un archivo de directorios:
+  - `HE1_MODE=process`
+  - `HE1_LABEL=L112-L114`
+  - `HE1_INPUT=/work/fuentes_txt/PATH_DIRECTORIOS_1.txt`
+- Procesar y generar HTML en una sola corrida:
+  - `HE1_MODE=process_report`
+  - `HE1_LABEL=L112-L114`
+  - `HE1_INPUT=/work/fuentes_txt/PATH_DIRECTORIOS_1.txt`
+- Restaurar:
+  - `HE1_MODE=restore`
+  - `HE1_TARGET=L112-L114`
+- Generar HTML:
+  - `HE1_MODE=report`
+  - `HE1_TARGET=L112-L114`
+
+En `process_report`, el contenedor ejecuta primero `process` y luego `report` usando la misma etiqueta. El HTML queda en la carpeta del respaldo de esa corrida.
+
+Dentro del contenedor, las rutas deben ser Linux. El repo del host se monta en `/work`.
+
+## Telegram local sin VPS
+
+El bot corre en el mismo equipo y usa `long polling`. No necesita IP publica ni webhook.
+
+Variables requeridas:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `HE1_MODE=telegram`
+- `HE1_INPUT` como entrada por defecto si usas `/process <etiqueta>` sin ruta extra
+
+Comandos:
+
+- `/process <etiqueta> [ruta_input]`
+- `/process_report <etiqueta> [ruta_input]`
+- `/restore <etiqueta | ruta_manifest_o_respaldo>`
+- `/report <etiqueta | ruta_manifest_o_respaldo>`
+
+Flujo tipico:
+
+1. Levantas el contenedor o el binario con `HE1_MODE=telegram`.
+2. Desde el celular envias `/process L112-L114`.
+3. Si quieres el HTML en la misma corrida, usas `/process_report L112-L114`.
+4. Para revertir, usas `/restore L112-L114`.
+5. Para volver a generar el HTML, usas `/report L112-L114`.
+
+El bot solo responde al `TELEGRAM_CHAT_ID` configurado y devuelve el HTML como adjunto cuando aplica.
 
 ## Regla de nombres
 

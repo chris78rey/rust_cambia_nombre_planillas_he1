@@ -1,0 +1,13 @@
+.git
+.gitignore
+target/
+pdfs/
+he1_respaldo/
+.he1_label_index/
+fuentes_txt/.he1_respaldo/
+fuentes_txt/*.txt
+**/Cambios.txt
+**/.he1_procesado
+**/.he1_aux_temporal/
+**/*.tmp.pdf
+.env

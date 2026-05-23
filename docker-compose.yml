@@ -1,0 +1,13 @@
+services:
+  he1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: he1-unificar-pdfs:local
+    working_dir: ${WORKDIR:-/work}
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ${HOST_REPO:-.}
+        target: ${WORKDIR:-/work}

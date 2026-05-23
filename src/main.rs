@@ -8,6 +8,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod telegram;
+
 const VALID_NAMES: &[&str] = &[
     "PI", "CC", "CV", "AES", "053", "006", "007", "017", "018", "018A", "113", "114", "115", "ORS",
     "002", "010A", "010B", "012A", "012B", "033", "013A", "013B", "PTR", "RTR", "08", "008",
@@ -22,6 +24,7 @@ enum AppMode {
     Process { input: PathBuf, label: String },
     Restore(String),
     Report(String),
+    Telegram,
     Help,
 }
 
@@ -40,6 +43,7 @@ struct RunSummary {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     match parse_args()? {
         AppMode::Help => {
             print_usage();
@@ -47,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         AppMode::Restore(target) => restore_from_backup(&target),
         AppMode::Report(target) => generate_html_report(&target),
+        AppMode::Telegram => telegram::run(),
         AppMode::Process { input, label } => run_process_mode(&input, &label),
     }
 }
@@ -56,6 +61,13 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
 
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok(AppMode::Help);
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--telegram") {
+        if args.len() != 1 {
+            return Err("uso: he1-unificar-pdfs --telegram".into());
+        }
+        return Ok(AppMode::Telegram);
     }
 
     if args.first().map(|s| s.as_str()) == Some("--restore") {
@@ -568,6 +580,7 @@ fn print_usage() {
     println!("  he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>");
     println!("  he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>");
     println!("  he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>");
+    println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("ejemplo:");
     println!("  he1-unificar-pdfs --label folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
@@ -575,6 +588,7 @@ fn print_usage() {
     println!("  he1-unificar-pdfs --report folder_0001");
     println!("  he1-unificar-pdfs --restore G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
     println!("  he1-unificar-pdfs --report G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
+    println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("comportamiento:");
     println!("  - si la entrada es .txt, cada linea valida se interpreta como carpeta");
@@ -585,8 +599,15 @@ fn print_usage() {
     println!("  - el respaldo se guarda en una carpeta visible he1_respaldo");
     println!("  - --restore reconstruye los originales y elimina los PDFs generados");
     println!("  - --report genera un HTML con la fecha de proceso en hora de Ecuador");
+    println!("  - --telegram escucha comandos por Telegram desde este mismo equipo");
     println!("  - deja un log Cambios.txt con el detalle de la ejecucion");
     println!("  - documentacion de reglas: ver REGLA_UNIFICACION.md");
+    println!();
+    println!("telegram:");
+    println!("  - requiere TELEGRAM_BOT_TOKEN");
+    println!("  - requiere TELEGRAM_CHAT_ID");
+    println!("  - requiere HE1_INPUT para /process y /process_report");
+    println!("  - comandos: /process <etiqueta>, /process_report <etiqueta>, /restore <etiqueta>, /report <etiqueta>");
     println!();
     println!("regla de nombres:");
     println!("  - acepta base.pdf");
@@ -1485,6 +1506,18 @@ fn manifest_path_from_target(target: &str) -> Result<PathBuf, Box<dyn std::error
     }
 }
 
+fn report_path_from_target(target: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let manifest_path = manifest_path_from_target(target)?;
+    if !manifest_path.exists() {
+        return Err(format!("no se encontro manifest: {}", manifest_path.display()).into());
+    }
+
+    let report_root = manifest_path
+        .parent()
+        .ok_or_else(|| format!("no se puede determinar la carpeta del manifest: {}", manifest_path.display()))?;
+    Ok(report_root.join("reporte_ecuador.html"))
+}
+
 fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = manifest_path_from_target(target)?;
 
@@ -1531,20 +1564,9 @@ fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = manifest_path_from_target(target)?;
-
-    if !manifest_path.exists() {
-        return Err(format!("no se encontro manifest: {}", manifest_path.display()).into());
-    }
+    let report_path = report_path_from_target(target)?;
 
     let manifest = read_manifest(&manifest_path)?;
-    if manifest.backups.is_empty() && manifest.outputs.is_empty() {
-        return Err(format!("manifest vacio: {}", manifest_path.display()).into());
-    }
-
-    let report_root = manifest_path
-        .parent()
-        .ok_or_else(|| format!("no se puede determinar la carpeta del manifest: {}", manifest_path.display()))?;
-    let report_path = report_root.join("reporte_ecuador.html");
     let label_display = manifest
         .header
         .label
