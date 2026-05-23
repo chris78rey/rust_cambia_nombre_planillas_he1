@@ -6,5 +6,6 @@ pdfs/
 **/.he1_procesado
 **/.he1_aux_temporal/
 **/*.tmp.pdf
+fuentes_txt/*.txt
 fuentes_txt/.he1_respaldo/
 fuentes_txt/_restore_*_manifest.txt
