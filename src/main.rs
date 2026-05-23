@@ -228,6 +228,7 @@ fn print_usage() {
     println!("  - genera <base>.pdf sin modificar los originales");
     println!("  - deja un log Cambios.txt con el detalle de la ejecucion");
     println!("  - si existe base.pdf y variantes como base123.pdf, se unen y base.pdf queda como salida final");
+    println!("  - lecciones aprendidas: ver LECCIONES_APRENDIDAS.md");
     println!();
     println!("ejemplos extremos:");
     println!("  - PI.pdf + PI13.pdf + PI5554.pdf -> PI.pdf");

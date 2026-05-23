@@ -2,6 +2,10 @@
 
 Este documento define la regla actual del script `he1-unificar-pdfs`.
 
+Ver también:
+
+- [Lecciones aprendidas](./LECCIONES_APRENDIDAS.md)
+
 ## Objetivo
 
 Tomar PDFs dentro de una carpeta, identificar nombres canónicos válidos y consolidar sus variantes en un solo archivo final con nombre canónico.
@@ -87,3 +91,9 @@ El script deja un `Cambios.txt` en la carpeta raíz procesada con:
 - verificación,
 - archivos eliminados,
 - casos ignorados o no clasificados.
+
+## Nota operativa
+
+Si vas a retomar el proyecto después de varios meses, revisa también:
+
+- [Lecciones aprendidas](./LECCIONES_APRENDIDAS.md)
