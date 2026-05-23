@@ -14,10 +14,12 @@ const VALID_NAMES: &[&str] = &[
     "FSCS", "FSICS", "FRDCS", "ANX2", "HR", "RHD", "IMT", "CEC", "RAD", "ITS", "RVD", "119",
 ];
 
+const LABEL_INDEX_DIR: &str = ".he1_label_index";
+
 #[derive(Debug)]
 enum AppMode {
-    Process(PathBuf),
-    Restore(PathBuf),
+    Process { input: PathBuf, label: String },
+    Restore(String),
     Help,
 }
 
@@ -33,8 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage();
             Ok(())
         }
-        AppMode::Restore(path) => restore_from_backup(&path),
-        AppMode::Process(path) => run_process_mode(&path),
+        AppMode::Restore(target) => restore_from_backup(&target),
+        AppMode::Process { input, label } => run_process_mode(&input, &label),
     }
 }
 
@@ -47,19 +49,25 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
 
     if args.first().map(|s| s.as_str()) == Some("--restore") {
         if args.len() != 2 {
-            return Err("uso: he1-unificar-pdfs --restore <ruta_respaldo_o_manifest.txt>".into());
+            return Err("uso: he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>".into());
         }
-        return Ok(AppMode::Restore(PathBuf::from(&args[1])));
+        return Ok(AppMode::Restore(args[1].clone()));
     }
 
-    if args.len() != 1 {
-        return Err("uso: he1-unificar-pdfs <ruta.txt | carpeta>".into());
+    if args.first().map(|s| s.as_str()) == Some("--label") {
+        if args.len() != 3 {
+            return Err("uso: he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>".into());
+        }
+        return Ok(AppMode::Process {
+            input: PathBuf::from(&args[2]),
+            label: args[1].clone(),
+        });
     }
 
-    Ok(AppMode::Process(PathBuf::from(&args[0])))
+    Err("uso: he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>".into())
 }
 
-fn run_process_mode(input: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_process_mode(input: &Path, label: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("ruta no existe: {}", input.display()).into());
     }
@@ -71,9 +79,9 @@ fn run_process_mode(input: &Path) -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.eq_ignore_ascii_case("txt"))
             == Some(true)
     {
-        run_directory_list(input)
+        run_directory_list(input, Some(label))
     } else if input.is_dir() {
-        run_directories(vec![input.to_path_buf()], input)
+        run_directories(vec![input.to_path_buf()], input, Some(label), &[])
     } else {
         Err(format!(
             "la entrada debe ser una carpeta o un archivo .txt: {}",
@@ -83,9 +91,21 @@ fn run_process_mode(input: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_directory_list(list_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let directories = read_directory_list(list_file)?;
+fn run_directory_list(
+    list_file: &Path,
+    label: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let DirectoryListReadResult {
+        directories,
+        errors,
+    } = read_directory_list(list_file)?;
     if directories.is_empty() {
+        if !errors.is_empty() {
+            println!("errores en el archivo de directorios:");
+            for error in &errors {
+                println!("  linea {}: {}", error.line_number, error.message);
+            }
+        }
         return Err(format!(
             "el archivo de directorios no contiene rutas validas: {}",
             list_file.display()
@@ -93,23 +113,48 @@ fn run_directory_list(list_file: &Path) -> Result<(), Box<dyn std::error::Error>
         .into());
     }
 
-    run_directories(directories, list_file)
+    if !errors.is_empty() {
+        println!(
+            "se omitieron {} linea(s) con error; quedan registradas en el log",
+            errors.len()
+        );
+    }
+
+    run_directories(directories, list_file, label, &errors)
 }
 
 fn run_directories(
     directories: Vec<PathBuf>,
     source_label: &Path,
+    label: Option<&str>,
+    directory_errors: &[DirectoryListError],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let log_root = source_label.parent().unwrap_or(source_label);
+    let log_root = log_root_for(source_label);
     let mut change_log = ChangeLog::new(log_root)?;
-    let mut backup_session = RunBackupSession::new(source_label, log_root)?;
+    let mut backup_session = RunBackupSession::new(source_label, log_root, label)?;
 
     change_log.write_line(format!("INICIO corrida: {}", timestamp_now()))?;
     change_log.write_line(format!("FUENTE: {}", source_label.display()))?;
+    if let Some(label) = label {
+        change_log.write_line(format!("ETIQUETA: {}", label))?;
+    }
     change_log.write_line(format!(
         "RESPALDO: {}",
         backup_session.root.display()
     ))?;
+    if !directory_errors.is_empty() {
+        change_log.write_line(format!(
+            "ARCHIVO DE DIRECTORIOS CON ERRORES: {}",
+            source_label.display()
+        ))?;
+        for error in directory_errors {
+            change_log.write_line(format!(
+                "OMITIDA linea {}: {}",
+                error.line_number,
+                error.message
+            ))?;
+        }
+    }
     change_log.write_line("FASE 1: unificacion por reglas canonicas")?;
 
     let mut total_groups = 0usize;
@@ -172,6 +217,13 @@ fn process_folder(
     println!("analizando carpeta: {}", folder.display());
     change_log.write_line(format!("CARPETA: {}", folder.display()))?;
     backup_session.record_folder(folder)?;
+    let mut folder_audit = FolderAudit::new(folder)?;
+    folder_audit.write_line(format!("AUDITORIA: {}", folder.display()))?;
+    folder_audit.write_line(format!("INICIO: {}", timestamp_now()))?;
+    folder_audit.write_line(format!(
+        "RUTA_AUX: {}",
+        folder.join(".he1_aux_temporal").display()
+    ))?;
 
     let mut pdf_files = Vec::new();
     let mut pdf_count = 0usize;
@@ -211,14 +263,17 @@ fn process_folder(
         } else {
             println!("ignorado: {}", file_name);
             change_log.write_line(format!("  IGNORADO: {}", file_name))?;
+            folder_audit.write_line(format!("  IGNORADO: {}", file_name))?;
         }
     }
 
     println!("  PDFs encontrados: {}", pdf_count);
     change_log.write_line(format!("  PDFs encontrados: {}", pdf_count))?;
+    folder_audit.write_line(format!("  PDFs encontrados: {}", pdf_count))?;
 
     for (file_name, base) in ignored_files {
         change_log.write_line(format!("  OBSERVADO: {} | base {}", file_name, base))?;
+        folder_audit.write_line(format!("  OBSERVADO: {} | base {}", file_name, base))?;
     }
 
     let mut summary = FolderSummary::default();
@@ -234,15 +289,21 @@ fn process_folder(
             files.sort();
             println!("  base {} con {} archivos", base, files.len());
             change_log.write_line(format!("  base {} con {} archivos", base, files.len()))?;
+            folder_audit.write_line(format!("  base {} con {} archivos", base, files.len()))?;
             change_log.write_line(format!("    antes: {}", describe_files(&files)))?;
+            folder_audit.write_line(format!("    antes: {}", describe_files(&files)))?;
 
             let output = canonical_output_path(folder, base);
             if files.len() == 1 {
                 let source = &files[0];
-                if source == &output {
+                if paths_equivalent(source, &output) {
                     println!("  base {} ya consolidada en {}", base, output.display());
                     change_log.write_line(format!("    despues: {}", output.display()))?;
+                    folder_audit.write_line(format!("    despues: {}", output.display()))?;
                     change_log.write_line(
+                        "    accion: omitido para no reprocesar el archivo unificado",
+                    )?;
+                    folder_audit.write_line(
                         "    accion: omitido para no reprocesar el archivo unificado",
                     )?;
                     continue;
@@ -259,6 +320,8 @@ fn process_folder(
                 println!("  base {} renombrada directo a {}", base, output.display());
                 change_log.write_line(format!("    despues: {}", output.display()))?;
                 change_log.write_line("    accion: renombrado directo sin union")?;
+                folder_audit.write_line(format!("    despues: {}", output.display()))?;
+                folder_audit.write_line("    accion: renombrado directo sin union")?;
                 continue;
             }
 
@@ -280,7 +343,7 @@ fn process_folder(
             for path in &files {
                 backup_path_if_needed(backup_session, &mut folder_backups, path)?;
             }
-            if output.exists() && !files.iter().any(|p| p == &output) {
+            if output.exists() && !files.iter().any(|p| paths_equivalent(p, &output)) {
                 backup_path_if_needed(backup_session, &mut folder_backups, &output)?;
             }
 
@@ -288,6 +351,8 @@ fn process_folder(
             fs::create_dir_all(&aux_dir)?;
             let aux_paths = build_aux_paths(&files, &aux_dir)?;
             copy_to_aux(&files, &aux_paths)?;
+            folder_audit.write_line(format!("    aux_dir: {}", aux_dir.display()))?;
+            folder_audit.write_line(format!("    copias_aux: {}", describe_files(&aux_paths)))?;
             let temp_output = folder.join(format!("{}.tmp.pdf", base));
             merge_pdfs(&aux_paths, &temp_output)?;
             if output.exists() {
@@ -302,6 +367,10 @@ fn process_folder(
                     "    ERROR verificacion fallo: paginas fuente={} paginas salida={}",
                     source_pages, merged_pages
                 ))?;
+                folder_audit.write_line(format!(
+                    "    ERROR verificacion fallo: paginas fuente={} paginas salida={}",
+                    source_pages, merged_pages
+                ))?;
                 return Err(format!(
                     "verificacion fallo para {}: paginas fuente={} paginas salida={}",
                     output.display(),
@@ -312,6 +381,7 @@ fn process_folder(
             }
             if merged_size == 0 {
                 change_log.write_line("    ERROR verificacion fallo: bytes salida=0")?;
+                folder_audit.write_line("    ERROR verificacion fallo: bytes salida=0")?;
                 return Err(format!(
                     "verificacion fallo para {}: bytes salida=0",
                     output.display()
@@ -336,8 +406,15 @@ fn process_folder(
                 merged_size
             );
             change_log.write_line(format!("    salida: {}", output.display()))?;
+            folder_audit.write_line(format!("    salida: {}", output.display()))?;
             for (path, pages, size) in per_file_pages {
                 change_log.write_line(format!(
+                    "    fuente verificada: {} | paginas={} | bytes={}",
+                    path.display(),
+                    pages,
+                    size
+                ))?;
+                folder_audit.write_line(format!(
                     "    fuente verificada: {} | paginas={} | bytes={}",
                     path.display(),
                     pages,
@@ -348,7 +425,12 @@ fn process_folder(
                 "    verificacion: paginas fuente={} bytes fuente={} paginas salida={} bytes salida={}",
                 source_pages, source_size, merged_pages, merged_size
             ))?;
+            folder_audit.write_line(format!(
+                "    verificacion: paginas fuente={} bytes fuente={} paginas salida={} bytes salida={}",
+                source_pages, source_size, merged_pages, merged_size
+            ))?;
             change_log.write_line("    estado: completado con exito")?;
+            folder_audit.write_line("    estado: completado con exito")?;
         }
 
         fs::write(
@@ -356,6 +438,7 @@ fn process_folder(
             format!("procesado_en={}\n", timestamp_now()),
         )?;
         change_log.write_line(format!("MARCA CREADA: {}", processed_marker.display()))?;
+        folder_audit.write_line(format!("MARCA CREADA: {}", processed_marker.display()))?;
         Ok(())
     })();
 
@@ -386,7 +469,7 @@ fn restore_folder_state(
     backup_session: &RunBackupSession,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for output in outputs {
-        if !backed_up.contains(output) && output.exists() {
+        if !backed_up.iter().any(|path| paths_equivalent(path, output)) && output.exists() {
             fs::remove_file(output)?;
         }
     }
@@ -421,7 +504,20 @@ fn cleanup_generated_artifacts(folder: &Path) -> Result<(), Box<dyn std::error::
 
     let aux_dir = folder.join(".he1_aux_temporal");
     if aux_dir.exists() {
-        fs::remove_dir_all(aux_dir)?;
+        for entry in fs::read_dir(&aux_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let keep_audit = path.file_name().and_then(|s| s.to_str()) == Some("auditoria.txt");
+            if keep_audit {
+                continue;
+            }
+
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else if path.is_file() {
+                fs::remove_file(path)?;
+            }
+        }
     }
 
     for entry in fs::read_dir(folder)? {
@@ -442,12 +538,12 @@ fn cleanup_generated_artifacts(folder: &Path) -> Result<(), Box<dyn std::error::
 
 fn print_usage() {
     println!("uso:");
-    println!("  he1-unificar-pdfs <ruta.txt | carpeta>");
-    println!("  he1-unificar-pdfs --restore <ruta_respaldo_o_manifest.txt>");
+    println!("  he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>");
+    println!("  he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>");
     println!();
     println!("ejemplo:");
-    println!("  he1-unificar-pdfs G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS_100.txt");
-    println!("  he1-unificar-pdfs G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
+    println!("  he1-unificar-pdfs --label folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
+    println!("  he1-unificar-pdfs --restore folder_0001");
     println!("  he1-unificar-pdfs --restore G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\.he1_respaldo\\run_...\\manifest.txt");
     println!();
     println!("comportamiento:");
@@ -459,7 +555,7 @@ fn print_usage() {
     println!("  - el respaldo se guarda en una carpeta oculta .he1_respaldo");
     println!("  - --restore reconstruye los originales y elimina los PDFs generados");
     println!("  - deja un log Cambios.txt con el detalle de la ejecucion");
-    println!("  - lecciones aprendidas: ver LECCIONES_APRENDIDAS.md");
+    println!("  - documentacion de reglas: ver REGLA_UNIFICACION.md");
     println!();
     println!("regla de nombres:");
     println!("  - acepta base.pdf");
@@ -480,15 +576,85 @@ fn canonical_output_path(folder: &Path, base: &str) -> PathBuf {
     folder.join(format!("{}.pdf", base))
 }
 
-fn read_directory_list(list_file: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn log_root_for(source_label: &Path) -> &Path {
+    match source_label.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut left_components = left.components();
+        let mut right_components = right.components();
+
+        loop {
+            match (left_components.next(), right_components.next()) {
+                (None, None) => return true,
+                (Some(l), Some(r)) if components_equivalent(l, r) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+#[cfg(windows)]
+fn components_equivalent(left: std::path::Component<'_>, right: std::path::Component<'_>) -> bool {
+    use std::path::Component::*;
+
+    match (left, right) {
+        (Prefix(lp), Prefix(rp)) => lp
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&rp.as_os_str().to_string_lossy()),
+        (RootDir, RootDir) => true,
+        (CurDir, CurDir) => true,
+        (ParentDir, ParentDir) => true,
+        (Normal(ln), Normal(rn)) => ln
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&rn.to_string_lossy()),
+        _ => false,
+    }
+}
+
+struct DirectoryListError {
+    line_number: usize,
+    message: String,
+}
+
+struct DirectoryListReadResult {
+    directories: Vec<PathBuf>,
+    errors: Vec<DirectoryListError>,
+}
+
+fn read_directory_list(
+    list_file: &Path,
+) -> Result<DirectoryListReadResult, Box<dyn std::error::Error>> {
     let file = File::open(list_file)?;
     let reader = BufReader::new(file);
     let base_dir = list_file.parent().unwrap_or(Path::new("."));
     let mut directories = Vec::new();
     let mut seen = HashSet::new();
+    let mut errors = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    for (line_number, line) in reader.lines().enumerate() {
+        let line_number = line_number + 1;
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                errors.push(DirectoryListError {
+                    line_number,
+                    message: format!("no se pudo leer la linea: {}", err),
+                });
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -500,16 +666,32 @@ fn read_directory_list(list_file: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
         } else {
             base_dir.join(raw_path)
         };
-        let canonical = fs::canonicalize(&resolved)?;
+        let canonical = match fs::canonicalize(&resolved) {
+            Ok(canonical) => canonical,
+            Err(err) => {
+                errors.push(DirectoryListError {
+                    line_number,
+                    message: format!("no se pudo resolver {}: {}", resolved.display(), err),
+                });
+                continue;
+            }
+        };
         if !canonical.is_dir() {
-            return Err(format!("la ruta no es carpeta: {}", canonical.display()).into());
+            errors.push(DirectoryListError {
+                line_number,
+                message: format!("la ruta no es carpeta: {}", canonical.display()),
+            });
+            continue;
         }
         if seen.insert(canonical.clone()) {
             directories.push(canonical);
         }
     }
 
-    Ok(directories)
+    Ok(DirectoryListReadResult {
+        directories,
+        errors,
+    })
 }
 
 struct ChangeLog {
@@ -521,6 +703,30 @@ impl ChangeLog {
         fs::create_dir_all(root)?;
         let path = root.join("Cambios.txt");
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { file })
+    }
+
+    fn write_line<S: AsRef<str>>(&mut self, line: S) -> Result<(), Box<dyn std::error::Error>> {
+        writeln!(self.file, "{}", line.as_ref())?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+struct FolderAudit {
+    file: File,
+}
+
+impl FolderAudit {
+    fn new(folder: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let audit_dir = folder.join(".he1_aux_temporal");
+        fs::create_dir_all(&audit_dir)?;
+        let audit_path = audit_dir.join("auditoria.txt");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(audit_path)?;
         Ok(Self { file })
     }
 
@@ -551,8 +757,12 @@ impl BackupManifest {
         &mut self,
         source_label: &Path,
         backup_root: &Path,
+        label: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(self.file, "timestamp={}", timestamp_now())?;
+        if let Some(label) = label {
+            writeln!(self.file, "label={}", label)?;
+        }
         writeln!(self.file, "source_label={}", source_label.display())?;
         writeln!(self.file, "backup_root={}", backup_root.display())?;
         self.file.flush()?;
@@ -594,12 +804,35 @@ struct RunBackupSession {
 }
 
 impl RunBackupSession {
-    fn new(source_label: &Path, storage_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let run_root = storage_root
-            .join(".he1_respaldo")
-            .join(format!("run_{}_{}", timestamp_now(), std::process::id()));
+    fn new(
+        source_label: &Path,
+        storage_root: &Path,
+        label: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let run_root = if let Some(label) = label {
+            validate_backup_label(label)?;
+            storage_root.join(".he1_respaldo").join(label)
+        } else {
+            storage_root
+                .join(".he1_respaldo")
+                .join(format!("run_{}_{}", timestamp_now(), std::process::id()))
+        };
+
+        if run_root.exists() {
+            if let Some(label) = label {
+                return Err(format!("ya existe un respaldo para la etiqueta: {}", label).into());
+            }
+        }
+
         let mut manifest = BackupManifest::new(&run_root)?;
-        manifest.write_header(source_label, &run_root)?;
+        manifest.write_header(source_label, &run_root, label)?;
+
+        if let Some(label) = label {
+            let manifest_path = fs::canonicalize(run_root.join("manifest.txt"))
+                .unwrap_or_else(|_| run_root.join("manifest.txt"));
+            write_label_index(label, &manifest_path)?;
+        }
+
         Ok(Self {
             root: run_root,
             manifest,
@@ -664,6 +897,80 @@ fn sanitize_backup_component(value: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+fn validate_backup_label(label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if label.is_empty() {
+        return Err("la etiqueta no puede estar vacia".into());
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(format!(
+            "la etiqueta contiene caracteres no permitidos: {}",
+            label
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn label_index_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(env::current_dir()?.join(LABEL_INDEX_DIR))
+}
+
+fn label_index_path(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    validate_backup_label(label)?;
+    Ok(label_index_dir()?.join(format!("{}.txt", label)))
+}
+
+fn write_label_index(label: &str, manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let index_path = label_index_path(label)?;
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(index_path)?;
+    writeln!(file, "label={}", label)?;
+    writeln!(file, "manifest={}", manifest_path.display())?;
+    writeln!(file, "timestamp={}", timestamp_now())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn resolve_manifest_from_label(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let index_path = label_index_path(label)?;
+    if !index_path.exists() {
+        return Err(format!(
+            "no existe un respaldo indexado para la etiqueta: {}",
+            label
+        )
+        .into());
+    }
+
+    let file = File::open(&index_path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(rest) = line.strip_prefix("manifest=") {
+            let manifest_path = PathBuf::from(rest);
+            if manifest_path.exists() {
+                return Ok(manifest_path);
+            }
+            return Err(format!(
+                "el manifest indexado no existe: {}",
+                manifest_path.display()
+            )
+            .into());
+        }
+    }
+
+    Err(format!("indice de etiqueta invalido: {}", index_path.display()).into())
 }
 
 fn detect_group_base(stem: &str) -> Option<&'static str> {
@@ -771,7 +1078,7 @@ fn cleanup_aux(aux_paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> 
 
 fn delete_sources(files: &[PathBuf], output: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for path in files {
-        if path == output {
+        if paths_equivalent(path, output) {
             continue;
         }
         if path.exists() {
@@ -938,13 +1245,20 @@ struct ManifestData {
     folders: HashSet<PathBuf>,
 }
 
-fn restore_from_backup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_path = if path.is_file() {
-        path.to_path_buf()
-    } else if path.is_dir() {
-        path.join("manifest.txt")
+fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let target_path = Path::new(target);
+    let manifest_path = if target_path.exists() {
+        if target_path.is_file() {
+            target_path.to_path_buf()
+        } else if target_path.is_dir() {
+            target_path.join("manifest.txt")
+        } else {
+            return Err(format!("ruta de respaldo no valida: {}", target_path.display()).into());
+        }
+    } else if looks_like_path_target(target) {
+        return Err(format!("ruta de respaldo no valida: {}", target_path.display()).into());
     } else {
-        return Err(format!("ruta de respaldo no valida: {}", path.display()).into());
+        resolve_manifest_from_label(target)?
     };
 
     if !manifest_path.exists() {
@@ -960,7 +1274,7 @@ fn restore_from_backup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         manifest.backups.iter().map(|(original, _)| original.clone()).collect();
 
     for output in manifest.outputs {
-        if !original_paths.contains(&output) && output.exists() {
+        if !original_paths.iter().any(|path| paths_equivalent(path, &output)) && output.exists() {
             fs::remove_file(&output)?;
             println!("restauracion: eliminado generado {}", output.display());
         }
@@ -986,4 +1300,51 @@ fn restore_from_backup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("restauracion completada desde {}", manifest_path.display());
     Ok(())
+}
+
+fn looks_like_path_target(value: &str) -> bool {
+    value.contains('\\') || value.contains('/') || value.contains(':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_single_component_uses_current_dir_as_root() {
+        let source_label = Path::new("folder_0001");
+        let log_root = log_root_for(source_label);
+
+        assert_eq!(log_root, Path::new("."));
+    }
+
+    #[test]
+    fn path_equivalence_matches_windows_case_insensitive_paths() {
+        #[cfg(windows)]
+        {
+            assert!(paths_equivalent(
+                Path::new(r"G:\repo\PI.pdf"),
+                Path::new(r"g:\REPO\pi.pdf")
+            ));
+        }
+    }
+
+    #[test]
+    fn backup_label_validation_accepts_safe_label() {
+        assert!(validate_backup_label("folder_0101").is_ok());
+        assert!(validate_backup_label("folder-0101.v1").is_ok());
+    }
+
+    #[test]
+    fn backup_label_validation_rejects_unsafe_label() {
+        assert!(validate_backup_label("folder 0101").is_err());
+        assert!(validate_backup_label("folder/0101").is_err());
+    }
+
+    #[test]
+    fn restore_target_detection_distinguishes_labels_from_paths() {
+        assert!(looks_like_path_target(r"G:\repo\respaldos\manifest.txt"));
+        assert!(looks_like_path_target(r"folder\sub"));
+        assert!(!looks_like_path_target("folder_0101"));
+    }
 }

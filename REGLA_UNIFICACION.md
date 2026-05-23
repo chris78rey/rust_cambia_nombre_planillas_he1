@@ -1,12 +1,36 @@
-# Regla de unificacion
+# Regla de unificacion y uso
 
-Este documento define la regla operativa que usa el ejecutable para agrupar y consolidar PDFs por nombre canonico.
+Este es el unico documento de ayuda del proyecto. Resume las reglas que aplica `src/main.rs`.
 
-## Canonicos validos
+## Comandos
 
-Los canonicos se definen en `src/main.rs` dentro de `VALID_NAMES`.
+- `he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>`
+- `he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>`
 
-## Regla de deteccion
+## Entrada
+
+- `--label` es obligatoria al procesar.
+- La entrada puede ser una carpeta o un archivo `.txt`.
+- Si la entrada es un `.txt`, cada linea valida se interpreta como una carpeta.
+- Las lineas vacias y las que empiezan con `#` se ignoran.
+- Si una linea no se puede resolver o no apunta a una carpeta valida, se informa con numero de linea y se siguen procesando las validas.
+
+## Respaldo y restauracion
+
+- Cada corrida crea un respaldo dentro de `.he1_respaldo` usando la etiqueta indicada.
+- El respaldo guarda el `manifest.txt` con la relacion entre originales y copias.
+- `--restore` recupera los originales desde ese respaldo y elimina los PDFs generados por la corrida.
+- La restauracion tambien limpia marcas temporales y evidencias auxiliares asociadas a la corrida.
+
+## Archivo de evidencia
+
+- El programa deja un `Cambios.txt` con el detalle de la ejecucion.
+- Si la entrada es una carpeta, el log queda en la carpeta padre.
+- Si la entrada es un `.txt`, el log queda junto al archivo de lista.
+
+## Regla de nombres
+
+Los canonicos validos se definen en `src/main.rs` dentro de `VALID_NAMES`.
 
 Un archivo pertenece a un grupo canonico cuando:
 
