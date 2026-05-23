@@ -17,7 +17,7 @@ Este es el unico documento de ayuda del proyecto. Resume las reglas que aplica `
 
 ## Respaldo y restauracion
 
-- Cada corrida crea un respaldo dentro de `.he1_respaldo` usando la etiqueta indicada.
+- Cada corrida crea un respaldo dentro de `he1_respaldo` usando la etiqueta indicada.
 - El respaldo guarda el `manifest.txt` con la relacion entre originales y copias.
 - `--restore` recupera los originales desde ese respaldo y elimina los PDFs generados por la corrida.
 - La restauracion tambien limpia marcas temporales y evidencias auxiliares asociadas a la corrida.
@@ -25,8 +25,8 @@ Este es el unico documento de ayuda del proyecto. Resume las reglas que aplica `
 ## Archivo de evidencia
 
 - El programa deja un `Cambios.txt` con el detalle de la ejecucion.
-- Si la entrada es una carpeta, el log queda en la carpeta padre.
-- Si la entrada es un `.txt`, el log queda junto al archivo de lista.
+- Si la entrada es una carpeta, el log queda en la raiz del proyecto.
+- Si la entrada es un `.txt`, el log queda en la raiz del proyecto.
 
 ## Regla de nombres
 
