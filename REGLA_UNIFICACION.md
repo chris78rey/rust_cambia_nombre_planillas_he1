@@ -1,99 +1,54 @@
-# Regla de unificación de PDFs
+# Regla de unificacion
 
-Este documento define la regla actual del script `he1-unificar-pdfs`.
+Este documento define la regla operativa que usa el ejecutable para agrupar y consolidar PDFs por nombre canonico.
 
-Ver también:
+## Canonicos validos
 
-- [Lecciones aprendidas](./LECCIONES_APRENDIDAS.md)
+Los canonicos se definen en `src/main.rs` dentro de `VALID_NAMES`.
 
-## Objetivo
+## Regla de deteccion
 
-Tomar PDFs dentro de una carpeta, identificar nombres canónicos válidos y consolidar sus variantes en un solo archivo final con nombre canónico.
+Un archivo pertenece a un grupo canonico cuando:
 
-## Nombres canónicos válidos
+1. El nombre base coincide exactamente con el canonico, por ejemplo `PI.pdf`.
+2. El nombre base empieza con el canonico y luego trae un sufijo permitido con `_` o `-`, por ejemplo:
+   - `PI_01.pdf`
+   - `PI-01.pdf`
+   - `AES_extra.pdf`
+   - `AES-extra.pdf`
+3. El nombre se normaliza antes de comparar. La normalizacion corta el nombre al encontrar espacios, parentesis, corchetes, llaves o puntos.
+4. Si el nombre normalizado termina en `_` o `-`, esos separadores finales se eliminan antes de comparar.
+5. La variante especial `RDH` se trata como `RHD`.
+6. La comparacion ignora mayusculas/minusculas, por eso `RHd-copia_extra.PDF` puede entrar como `RHD`.
 
-Los nombres canónicos aceptados son:
-
-`PI`, `CC`, `CV`, `AES`, `053`, `006`, `007`, `017`, `018`, `018A`, `113`, `114`, `115`, `ORS`, `002`, `010A`, `010B`, `012A`, `012B`, `033`, `013A`, `013B`, `PTR`, `RTR`, `08`, `008`, `FSCS`, `FSICS`, `FRDCS`, `ANX2`, `HR`, `RHD`, `IMT`, `CEC`, `RAD`, `ITS`, `RVD`, `119`
-
-## Regla principal
-
-Para cada nombre canónico:
-
-1. Se busca el archivo exacto `CANONICO.pdf`.
-2. Se buscan variantes con sufijo numérico separado por guion bajo:
-   - `CANONICO_1.pdf`
-   - `CANONICO_01.pdf`
-   - `CANONICO_2.pdf`
-   - `CANONICO_999.pdf`
-   - con la regla actual, cualquier texto después de `_` es válido, por ejemplo:
-     - `CANONICO_copia.pdf`
-     - `CANONICO_01_extra.pdf`
-     - `CANONICO_abc.pdf`
-3. Si existe solo una variante y no existe el archivo canónico exacto, la variante se renombra a `CANONICO.pdf`.
-4. Si existe el archivo canónico exacto más una o más variantes, todos esos archivos se unen y el resultado final queda como `CANONICO.pdf`.
-5. Después de una unión exitosa, los PDFs fuente del grupo se eliminan.
-
-## Extensión
-
-La salida final siempre usa la extensión `.pdf` en minúsculas.
-
-Ejemplos:
-
-- `RDH.PdF` termina como `RHD.pdf`
-- `PI_01.PDF` termina como `PI.pdf`
-
-## Casos permitidos
+## Ejemplos validos
 
 - `PI.pdf`
-- `PI_1.pdf`
 - `PI_01.pdf`
-- `PI_copia.pdf`
-- `PI_01_extra.pdf`
-- `CC.pdf`
-- `CC_2.pdf`
-- `008_12.pdf`
+- `PI-01.pdf`
+- `PI_extra.pdf`
+- `PI-extra.pdf`
+- `AES (copia).pdf` puede normalizarse a `AES.pdf`
+- `PI.copia.pdf` puede normalizarse a `PI.pdf`
+- `RHd-copia_extra.PDF` puede entrar como `RHD.pdf`
 
-## Casos no permitidos
+## Ejemplos no validos
 
-No se consideran variantes válidas:
+- `PI13.pdf`
+- `AES4545.pdf`
+- `PIx.pdf`
+- `AESx.pdf`
+- `PI+1.pdf`
 
-- `AES (copia).pdf`
-- `012abc.pdf`
-- `CC-1.pdf`
+Estos no son validos porque no usan `_` ni `-` como separador despues del canonico.
 
-`PI13.pdf` sigue sin entrar porque no tiene el separador `_`.
+## Verificacion operativa
 
-## Casos especiales
+Cuando el grupo se consolida:
 
-- `RDH.PdF` se corrige como `RHD.pdf` por una regla explícita de typo conocido.
-- `119a.pdf` no entra en la regla actual de variante permitida porque solo se aceptan sufijos numéricos separados por `_`.
-
-## Verificación
-
-Antes de aceptar una unión, el script compara:
-
-- cantidad de páginas de la fuente,
-- cantidad de páginas del resultado,
-- tamaño en bytes del resultado.
-
-Si la verificación falla, el proceso se aborta para ese grupo.
-
-## Registro
-
-El script deja un `Cambios.txt` en la carpeta raíz procesada con:
-
-- fecha de inicio y fin de corrida,
-- carpeta analizada,
-- archivos detectados,
-- antes y después por canónico,
-- salida final,
-- verificación,
-- archivos eliminados,
-- casos ignorados o no clasificados.
-
-## Nota operativa
-
-Si vas a retomar el proyecto después de varios meses, revisa también:
-
-- [Lecciones aprendidas](./LECCIONES_APRENDIDAS.md)
+- se cuentan las paginas de cada PDF fuente;
+- se genera una salida unica;
+- se valida que la suma de paginas de entrada coincida con la salida;
+- se valida que el PDF final no quede vacio;
+- solo si pasa la validacion se eliminan los fuentes del grupo;
+- si falla la corrida, se usa el respaldo de esa ejecucion para restaurar.

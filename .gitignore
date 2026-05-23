@@ -1,1 +1,10 @@
-/target
+target/
+pdfs/
+
+# Salidas temporales del proceso de unificacion
+**/Cambios.txt
+**/.he1_procesado
+**/.he1_aux_temporal/
+**/*.tmp.pdf
+fuentes_txt/.he1_respaldo/
+fuentes_txt/_restore_*_manifest.txt

@@ -1,57 +1,74 @@
-Quiero hacer con rust hacer la unificacion dentro de las carpetas a los pdfs, la carpeta no se topa ni los pdfs no se pueden mover del sitio original donde se encontraban, la idea es que los unicos nombres validos para que esto funcione son:
+# Instrucciones de uso
 
+Este proyecto usa `he1-unificar-pdfs` para procesar PDFs por carpeta.
 
-PI.pdf
-CC.pdf
-CV.pdf
-AES.pdf
-053.pdf
-006.pdf
-007.pdf
-017.pdf
-018.pdf
-018A.pdf
-113.pdf
-114.pdf
-115.pdf
-ORS.pdf
-002.pdf
-010A.pdf
-010B.pdf
-012A.pdf
-012B.pdf
-033.pdf
-013A.pdf
-013B.pdf
-PTR.pdf
-RTR.pdf
-08.pdf
-FSCS.pdf
-FSICS.pdf
-FRDCS.pdf
-ANX2.pdf
-HR.pdf
-RHD.pdf
-IMT.pdf
-CEC.pdf
-RAD.pdf
-ITS.pdf
-RVD.pdf
-119.pdf
+Hay dos modos de entrada:
 
+1. Una carpeta.
+2. Un archivo `.txt` con una ruta por linea.
 
-la idea es que por ejemplo se tiene la carpeta
+## Modo carpeta
 
-5555555 dentro de la carpeta esta asi
+Si la entrada es una carpeta, el programa procesa esa carpeta como una unidad.
 
-5555555
-	PI_01.pdf
-	PI_2.pdf
-	PI.pdf
-	CEC.pdf
-	RAD.pdf
+- Solo revisa los PDFs que estan directamente dentro de esa carpeta.
+- No mueve los archivos fuera de su ubicacion original.
+- Los PDFs que no cumplen la regla canonica se dejan intactos.
 
+## Modo lista de carpetas
 
-la idea es que aquellos que estan bien nombrados se mantengan asi por ejemplo 	RAD.pdf ya no hace falta toparlo pero 	PI_01.pdf, 	PI_2.pdf y 	PI.pdf se deberia hacer un proceso para renombrarlos a PI_01_aux.pdf , PI_2_aux.pdf y PI_aux.pdf se deberia revisar el contenido y unir estos auxiliares que en este caso son 3 pero puden ser mas o menos pdfs con nombres similares unirlos pero revisar es decir si es posible leer el contenido y verificar el tamaño individual y unido para saber que se hizo bien la operacion hagamos originalmente un script para probar en local
+Si la entrada es un archivo `.txt`, cada linea valida se interpreta como una carpeta.
 
+- Las lineas vacias se ignoran.
+- Las lineas que empiezan con `#` se ignoran.
+- Las rutas relativas se resuelven respecto a la carpeta donde esta el `.txt`.
+- Cada carpeta listada se procesa de forma independiente.
 
+Ejemplo de archivo:
+
+```txt
+G:\codex_projects\rust_cambia_nombre_planillas_he1\pdfs\folder_0001
+G:\codex_projects\rust_cambia_nombre_planillas_he1\pdfs\folder_0002
+G:\codex_projects\rust_cambia_nombre_planillas_he1\pdfs\folder_0003
+```
+
+## Respaldo
+
+Antes de tocar un archivo original, el programa guarda una copia de respaldo.
+
+- El respaldo se guarda en una carpeta oculta `.he1_respaldo`.
+- Cada corrida crea una carpeta propia con nombre tipo `run_<timestamp>_<pid>`.
+- El respaldo incluye un `manifest.txt` con la relacion entre originales y copias.
+- Solo se respaldan los PDFs que realmente se van a tocar.
+
+## Restauracion
+
+Para volver al estado previo, se puede ejecutar:
+
+```bash
+he1-unificar-pdfs --restore <ruta_respaldo_o_manifest.txt>
+```
+
+El comando de restauracion:
+
+- recupera los PDFs originales desde el respaldo;
+- elimina los PDFs generados que no existian antes;
+- limpia marcas temporales como `.he1_procesado` y `.he1_aux_temporal`.
+
+## Archivo de evidencia
+
+El programa deja un `Cambios.txt` en la carpeta contenedora del origen.
+
+- Si la entrada es una carpeta, `Cambios.txt` queda en la carpeta padre.
+- Si la entrada es un `.txt`, `Cambios.txt` queda junto al archivo de lista.
+
+## Regla de nombres
+
+Los nombres canonicos validos estan documentados en `REGLA_UNIFICACION.md`.
+
+La regla operativa actual es:
+
+- `base.pdf` se acepta;
+- `base_*.pdf` o `base-*.pdf` se acepta;
+- `AES (copia).pdf` y `PI.copia.pdf` tambien pueden reducirse al canonico por normalizacion;
+- `PI13.pdf` y `AES4545.pdf` no se aceptan porque no cumplen la regla con `_` ni con `-`.
