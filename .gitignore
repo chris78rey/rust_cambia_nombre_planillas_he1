@@ -17,3 +17,5 @@ fuentes_txt/_restore_*_manifest.txt
 repomix-output.xml
 telegram*.log
 fuentes_txt/tele
+go_aplicacion/bin/
+go_aplicacion/out/

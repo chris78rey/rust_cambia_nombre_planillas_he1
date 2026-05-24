@@ -1,13 +1,16 @@
-use reqwest::blocking::{multipart, Client};
+use reqwest::blocking::{Client, multipart};
 use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,6 +68,12 @@ struct Chat {
 
 enum TelegramCommand {
     Help,
+    Exit,
+    BeginProcess,
+    BeginProcessReport,
+    BeginFillPaths,
+    BeginRestore,
+    BeginReport,
     Process {
         label: String,
         input: Option<PathBuf>,
@@ -79,11 +88,24 @@ enum TelegramCommand {
     Report {
         target: String,
     },
+    FillPaths {
+        field: String,
+        value: Option<String>,
+    },
     Check {
         target: String,
         folder: PathBuf,
     },
     Unknown(String),
+}
+
+#[derive(Debug, Clone)]
+enum PendingAction {
+    Process { with_report: bool },
+    FillPathsField,
+    FillPathsValue { field: String },
+    Restore,
+    Report,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -129,15 +151,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 impl TelegramConfig {
     fn from_env() -> Result<Self, Box<dyn Error>> {
-        let token = env::var("TELEGRAM_BOT_TOKEN")
-            .map_err(|_| "falta TELEGRAM_BOT_TOKEN en el entorno")?;
+        let token =
+            env::var("TELEGRAM_BOT_TOKEN").map_err(|_| "falta TELEGRAM_BOT_TOKEN en el entorno")?;
         let chat_id = env::var("TELEGRAM_CHAT_ID")
             .map_err(|_| "falta TELEGRAM_CHAT_ID en el entorno")?
             .parse::<i64>()
             .map_err(|_| "TELEGRAM_CHAT_ID debe ser un numero entero")?;
-        let default_input = PathBuf::from(
-            env::var("HE1_INPUT").map_err(|_| "falta HE1_INPUT en el entorno")?,
-        );
+        let default_input =
+            PathBuf::from(env::var("HE1_INPUT").map_err(|_| "falta HE1_INPUT en el entorno")?);
 
         Ok(Self {
             token,
@@ -219,14 +240,16 @@ impl BackupCleanupWorker {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(BACKUP_CLEANUP_INTERVAL_SECONDS));
-            if thread_stop.load(Ordering::SeqCst) {
-                break;
-            }
+        let handle = thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(BACKUP_CLEANUP_INTERVAL_SECONDS));
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
 
-            if let Err(err) = super::cleanup_expired_backups() {
-                eprintln!("telegram retention error: {}", err);
+                if let Err(err) = super::cleanup_expired_backups() {
+                    eprintln!("telegram retention error: {}", err);
+                }
             }
         });
 
@@ -281,10 +304,211 @@ fn handle_message(
         return Ok(());
     };
 
+    if let Some(action) = take_pending_action(message.chat.id) {
+        let input_text = text.trim();
+        if is_cancel_text(input_text) {
+            clear_pending_action(message.chat.id);
+            send_message_with_markup(
+                client,
+                config,
+                "Operacion cancelada. Escribe /help para mostrar el menu otra vez.",
+                json!({
+                    "remove_keyboard": true,
+                    "selective": false
+                }),
+            )?;
+            return Ok(());
+        }
+
+        return match action {
+            PendingAction::Process { with_report } => {
+                let label = input_text;
+                if label.is_empty() {
+                    send_menu_message(
+                        client,
+                        config,
+                        "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
+                    )?;
+                    set_pending_action(message.chat.id, PendingAction::Process { with_report });
+                    return Ok(());
+                }
+
+                let input_path = &config.default_input;
+                send_message(
+                    client,
+                    config,
+                    &format!(
+                        "Procesando etiqueta {} con {}\nTe avisare cada 30 segundos mientras siga corriendo.",
+                        label,
+                        input_path.display()
+                    ),
+                )?;
+                process_and_reply(client, config, label, input_path, with_report)
+            }
+            PendingAction::FillPathsField => {
+                let field = input_text;
+                if field.is_empty() {
+                    send_fill_paths_field_menu(
+                        client,
+                        config,
+                        "El campo no puede estar vacio. Elige uno de los botones o escribelo.",
+                    )?;
+                    set_pending_action(message.chat.id, PendingAction::FillPathsField);
+                    return Ok(());
+                }
+
+                if let Err(err) = validate_ident(field) {
+                    send_fill_paths_field_menu(
+                        client,
+                        config,
+                        &format!("Campo invalido: {}. Elige otro campo valido.", err),
+                    )?;
+                    set_pending_action(message.chat.id, PendingAction::FillPathsField);
+                    return Ok(());
+                }
+
+                set_pending_action(
+                    message.chat.id,
+                    PendingAction::FillPathsValue {
+                        field: field.to_string(),
+                    },
+                );
+                send_message(
+                    client,
+                    config,
+                    &format!(
+                        "Campo seleccionado: {}\nAhora escribe el valor de filtro, por ejemplo 16364.",
+                        field
+                    ),
+                )
+            }
+            PendingAction::FillPathsValue { field } => {
+                let value = input_text;
+                if value.is_empty() {
+                    set_pending_action(
+                        message.chat.id,
+                        PendingAction::FillPathsValue {
+                            field: field.clone(),
+                        },
+                    );
+                    send_message(
+                        client,
+                        config,
+                        "El valor no puede estar vacio. Escribe un valor de filtro valido.",
+                    )?;
+                    return Ok(());
+                }
+
+                fill_paths_from_telegram(client, config, &field, value)
+            }
+            PendingAction::Restore => {
+                let label = input_text;
+                if label.is_empty() {
+                    send_menu_message(
+                        client,
+                        config,
+                        "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
+                    )?;
+                    set_pending_action(message.chat.id, PendingAction::Restore);
+                    return Ok(());
+                }
+                send_message(client, config, &format!("Restaurando {} ...", label))?;
+                super::restore_from_backup(label)?;
+                let manifest_path = super::manifest_path_from_target(label)?;
+                send_message(
+                    client,
+                    config,
+                    &format!(
+                        "Restauracion completada.\nManifest: {}",
+                        manifest_path.display()
+                    ),
+                )
+            }
+            PendingAction::Report => {
+                let label = input_text;
+                if label.is_empty() {
+                    send_menu_message(
+                        client,
+                        config,
+                        "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
+                    )?;
+                    set_pending_action(message.chat.id, PendingAction::Report);
+                    return Ok(());
+                }
+                send_message(
+                    client,
+                    config,
+                    &format!("Generando reporte para {} ...", label),
+                )?;
+                super::generate_html_report(label)?;
+                let report_path = super::report_path_from_target(label)?;
+                send_document(client, config, &report_path, "Reporte HTML generado")
+            }
+        };
+    }
+
     let command = parse_command(text)?;
     match command {
         TelegramCommand::Help => {
-            send_message(client, config, &help_text())?;
+            send_menu_message(client, config, &help_text())?;
+        }
+        TelegramCommand::Exit => {
+            clear_pending_action(message.chat.id);
+            send_message_with_markup(
+                client,
+                config,
+                "Menú oculto. Escribe /help para mostrar los botones otra vez.",
+                json!({
+                    "remove_keyboard": true,
+                    "selective": false
+                }),
+            )?;
+        }
+        TelegramCommand::BeginProcess => {
+            set_pending_action(
+                message.chat.id,
+                PendingAction::Process { with_report: false },
+            );
+            send_message(
+                client,
+                config,
+                "Escribe la etiqueta que quieres procesar. Ejemplo: PATH_DIRECTORIOS",
+            )?;
+        }
+        TelegramCommand::BeginProcessReport => {
+            set_pending_action(
+                message.chat.id,
+                PendingAction::Process { with_report: true },
+            );
+            send_message(
+                client,
+                config,
+                "Escribe la etiqueta para procesar y generar reporte. Ejemplo: PATH_DIRECTORIOS",
+            )?;
+        }
+        TelegramCommand::BeginFillPaths => {
+            set_pending_action(message.chat.id, PendingAction::FillPathsField);
+            send_fill_paths_field_menu(
+                client,
+                config,
+                "Elige el campo Oracle por el que quieres llenar PATH_DIRECTORIOS.txt.",
+            )?;
+        }
+        TelegramCommand::BeginRestore => {
+            set_pending_action(message.chat.id, PendingAction::Restore);
+            send_message(
+                client,
+                config,
+                "Escribe la etiqueta o la ruta del manifest/respaldo que quieres restaurar.",
+            )?;
+        }
+        TelegramCommand::BeginReport => {
+            set_pending_action(message.chat.id, PendingAction::Report);
+            send_message(
+                client,
+                config,
+                "Escribe la etiqueta o la ruta del manifest/respaldo para generar el reporte.",
+            )?;
         }
         TelegramCommand::Process { label, input } => {
             let input_path = input.as_deref().unwrap_or(&config.default_input);
@@ -308,15 +532,34 @@ fn handle_message(
             )?;
         }
         TelegramCommand::Report { target } => {
-            send_message(client, config, &format!("Generando reporte para {} ...", target))?;
-            super::generate_html_report(&target)?;
-            let report_path = super::report_path_from_target(&target)?;
-            send_document(
+            send_message(
                 client,
                 config,
-                &report_path,
-                "Reporte HTML generado",
+                &format!("Generando reporte para {} ...", target),
             )?;
+            super::generate_html_report(&target)?;
+            let report_path = super::report_path_from_target(&target)?;
+            send_document(client, config, &report_path, "Reporte HTML generado")?;
+        }
+        TelegramCommand::FillPaths { field, value } => {
+            if let Some(value) = value {
+                fill_paths_from_telegram(client, config, &field, &value)?;
+            } else {
+                set_pending_action(
+                    message.chat.id,
+                    PendingAction::FillPathsValue {
+                        field: field.clone(),
+                    },
+                );
+                send_message(
+                    client,
+                    config,
+                    &format!(
+                        "Campo seleccionado: {}\nAhora escribe el valor de filtro, por ejemplo 16364.",
+                        field
+                    ),
+                )?;
+            }
         }
         TelegramCommand::Check { target, folder } => {
             let report = super::build_folder_verification_report(&target, &folder)?;
@@ -483,36 +726,44 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
 
     let parsed = match command {
         "/start" | "/help" | "/ayuda" => TelegramCommand::Help,
-        "/process" | "/procesar" => {
-            let label = parts
-                .next()
-                .ok_or("uso: /process <etiqueta> [ruta_input]")?
-                .to_string();
-            let input = parts.next().map(PathBuf::from);
-            TelegramCommand::Process { label, input }
-        }
+        "/exit" | "/salir" | "Salir" => TelegramCommand::Exit,
+        "/process" | "/procesar" => match parts.next() {
+            Some(label) => TelegramCommand::Process {
+                label: label.to_string(),
+                input: parts.next().map(PathBuf::from),
+            },
+            None => TelegramCommand::BeginProcess,
+        },
         "/process_report" | "/process-report" | "/process+report" | "/procesar_reporte" => {
-            let label = parts
-                .next()
-                .ok_or("uso: /process_report <etiqueta> [ruta_input]")?
-                .to_string();
-            let input = parts.next().map(PathBuf::from);
-            TelegramCommand::ProcessReport { label, input }
+            match parts.next() {
+                Some(label) => TelegramCommand::ProcessReport {
+                    label: label.to_string(),
+                    input: parts.next().map(PathBuf::from),
+                },
+                None => TelegramCommand::BeginProcessReport,
+            }
         }
-        "/restore" | "/restaurar" => {
-            let target = parts
-                .next()
-                .ok_or("uso: /restore <etiqueta | ruta_manifest_o_respaldo>")?
-                .to_string();
-            TelegramCommand::Restore { target }
+        "/fp" | "/fill_paths" | "/fill-paths" | "/llenar_paths" | "/llenar" | "fp" | "FP" => {
+            match parts.next() {
+                Some(field) => TelegramCommand::FillPaths {
+                    field: field.to_string(),
+                    value: parts.next().map(|value| value.to_string()),
+                },
+                None => TelegramCommand::BeginFillPaths,
+            }
         }
-        "/report" | "/reporte" | "/html" => {
-            let target = parts
-                .next()
-                .ok_or("uso: /report <etiqueta | ruta_manifest_o_respaldo>")?
-                .to_string();
-            TelegramCommand::Report { target }
-        }
+        "/restore" | "/restaurar" => match parts.next() {
+            Some(target) => TelegramCommand::Restore {
+                target: target.to_string(),
+            },
+            None => TelegramCommand::BeginRestore,
+        },
+        "/report" | "/reporte" | "/html" => match parts.next() {
+            Some(target) => TelegramCommand::Report {
+                target: target.to_string(),
+            },
+            None => TelegramCommand::BeginReport,
+        },
         "/check" | "/verificar" => {
             let target = parts
                 .next()
@@ -538,6 +789,143 @@ fn normalize_command(command: &str) -> &str {
     command.split('@').next().unwrap_or(command)
 }
 
+fn is_cancel_text(text: &str) -> bool {
+    let normalized = normalize_command(text);
+    matches!(normalized, "/exit" | "/salir") || text == "Salir"
+}
+
+fn fill_paths_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("go_aplicacion/bin/path_directorios_fill")
+}
+
+fn fill_paths_output_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuentes_txt/PATH_DIRECTORIOS.txt")
+}
+
+fn validate_ident(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("campo vacio".to_string());
+    }
+
+    for ch in value.chars() {
+        if ch == '_' || ch == '$' || ch == '#' || ch == '.' {
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        return Err(format!("caracter invalido {}", ch));
+    }
+
+    Ok(())
+}
+
+fn fill_paths_from_telegram(
+    client: &Client,
+    config: &TelegramConfig,
+    field: &str,
+    value: &str,
+) -> Result<(), Box<dyn Error>> {
+    let binary = fill_paths_binary_path();
+    if !binary.exists() {
+        return Err(format!("no existe el binario esperado: {}", binary.display()).into());
+    }
+
+    let output_path = fill_paths_output_path();
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    send_message(
+        client,
+        config,
+        &format!(
+            "Llenando PATH_DIRECTORIOS.txt con {} = {}\nEsto puede tardar un poco.",
+            field, value
+        ),
+    )?;
+
+    let output = Command::new(&binary)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("ORACLE_FILTER_FIELD", field)
+        .env("ORACLE_FILTER_VALUE", value)
+        .env(
+            "SQLITE_DSN",
+            env::var("SQLITE_DSN")
+                .unwrap_or_else(|_| "file:/data_nuevo/repo_grande/data/folders.sqlite".to_string()),
+        )
+        .env("PATH_DIRECTORIOS_OUT", &output_path)
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        let mut details = String::new();
+        if !stdout.trim().is_empty() {
+            details.push_str(stdout.trim());
+        }
+        if !stderr.trim().is_empty() {
+            if !details.is_empty() {
+                details.push('\n');
+            }
+            details.push_str(stderr.trim());
+        }
+        if details.is_empty() {
+            details = "sin salida adicional".to_string();
+        }
+        return Err(format!("no se pudo llenar PATH_DIRECTORIOS.txt:\n{}", details).into());
+    }
+
+    let meta_path = output_path.with_extension("meta.txt");
+    let mut summary = format!(
+        "PATH_DIRECTORIOS.txt actualizado.\nCampo: {}\nValor: {}\n{}",
+        field,
+        value,
+        stdout.trim()
+    );
+    if !stderr.trim().is_empty() {
+        summary.push_str("\nstderr:\n");
+        summary.push_str(stderr.trim());
+    }
+    summary.push_str(&format!(
+        "\narchivo escrito en: {}\nmeta escrita en: {}",
+        output_path.display(),
+        meta_path.display()
+    ));
+
+    send_message(client, config, &summary)?;
+    Ok(())
+}
+
+fn send_fill_paths_field_menu(
+    client: &Client,
+    config: &TelegramConfig,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reply_markup = json!({
+        "keyboard": [
+            [
+                { "text": "DIG_ID_GENERACION" },
+                { "text": "DIG_ID_TRAMITE" }
+            ],
+            [
+                { "text": "DIG_TRAMITE" },
+                { "text": "Salir" }
+            ],
+            [
+                { "text": "/help" }
+            ]
+        ],
+        "resize_keyboard": true,
+        "one_time_keyboard": false,
+        "selective": false
+    });
+
+    send_message_with_markup(client, config, text, reply_markup)
+}
+
 fn get_updates(
     client: &Client,
     config: &TelegramConfig,
@@ -560,12 +948,26 @@ fn send_message(
     config: &TelegramConfig,
     text: &str,
 ) -> Result<(), Box<dyn Error>> {
+    send_message_with_markup(client, config, text, serde_json::Value::Null)
+}
+
+fn send_message_with_markup(
+    client: &Client,
+    config: &TelegramConfig,
+    text: &str,
+    reply_markup: serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let mut form = vec![
+        ("chat_id", config.chat_id.to_string()),
+        ("text", text.to_string()),
+    ];
+    if !reply_markup.is_null() {
+        form.push(("reply_markup", reply_markup.to_string()));
+    }
+
     let response = client
         .post(config.api_url("sendMessage"))
-        .form(&[
-            ("chat_id", config.chat_id.to_string()),
-            ("text", text.to_string()),
-        ])
+        .form(&form)
         .send()?
         .error_for_status()?;
     let payload: TelegramResponse<serde_json::Value> = response.json()?;
@@ -621,24 +1023,98 @@ fn decode_telegram_response<T>(payload: TelegramResponse<T>) -> Result<T, Box<dy
     }
 }
 
+fn send_menu_message(
+    client: &Client,
+    config: &TelegramConfig,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reply_markup = json!({
+        "keyboard": [
+            [
+                { "text": "/process" },
+                { "text": "/process_report" }
+            ],
+            [
+                { "text": "/report" },
+                { "text": "/restore" }
+            ],
+            [
+                { "text": "FP" }
+            ],
+            [
+                { "text": "/help" }
+            ],
+            [
+                { "text": "Salir" }
+            ]
+        ],
+        "resize_keyboard": true,
+        "one_time_keyboard": false,
+        "selective": false
+    });
+
+    let response = client
+        .post(config.api_url("sendMessage"))
+        .form(&[
+            ("chat_id", config.chat_id.to_string()),
+            ("text", text.to_string()),
+            ("reply_markup", reply_markup.to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+    let payload: TelegramResponse<serde_json::Value> = response.json()?;
+    let _ = decode_telegram_response(payload)?;
+    Ok(())
+}
+
 fn help_text() -> String {
-    [
-        "Comandos disponibles:",
-        "/process <etiqueta> [ruta_input]",
-        "/process_report <etiqueta> [ruta_input]",
-        "/restore <etiqueta | ruta_manifest_o_respaldo>",
-        "/report <etiqueta | ruta_manifest_o_respaldo>",
-        "/check <etiqueta | ruta_manifest_o_respaldo> <carpeta>",
-        "/help",
-        "",
-        "Notas:",
-        "- /process y /process_report usan HE1_INPUT si no indicas otra ruta.",
-        "- El bot envia avances resumidos por carpeta durante el proceso.",
-        "- El bot solo responde al chat configurado en TELEGRAM_CHAT_ID.",
-        "- El HTML se envia como archivo adjunto cuando se usa /process_report o /report.",
-        "- /check te dice desde Telegram si una carpeta aparece en el manifest y si conserva el marcador .he1_procesado.",
+    vec![
+        "Botones rapidos: /process, /process_report, /report, /restore, /fp".to_string(),
+        String::new(),
+        "Comandos disponibles:".to_string(),
+        "/process <etiqueta> [ruta_input]".to_string(),
+        "/process_report <etiqueta> [ruta_input]".to_string(),
+        "/restore <etiqueta | ruta_manifest_o_respaldo>".to_string(),
+        "/report <etiqueta | ruta_manifest_o_respaldo>".to_string(),
+        "/fp <campo> [valor]".to_string(),
+        "/check <etiqueta | ruta_manifest_o_respaldo> <carpeta>".to_string(),
+        "/help".to_string(),
+        "".to_string(),
+        "Notas:".to_string(),
+        "- Si tocas un boton, el bot te pedira la etiqueta o el campo antes de ejecutar.".to_string(),
+        "- /process y /process_report usan HE1_INPUT si no indicas otra ruta.".to_string(),
+        "- /fp llena PATH_DIRECTORIOS.txt usando Oracle y SQLite desde este equipo.".to_string(),
+        "- /fp te deja elegir el campo Oracle y luego escribir el valor de filtro.".to_string(),
+        "- El bot envia avances resumidos por carpeta durante el proceso.".to_string(),
+        "- El bot solo responde al chat configurado en TELEGRAM_CHAT_ID.".to_string(),
+        "- El HTML se envia como archivo adjunto cuando se usa /process_report o /report.".to_string(),
+        "- /check te dice desde Telegram si una carpeta aparece en el manifest y si conserva el marcador .he1_procesado.".to_string(),
     ]
     .join("\n")
+}
+
+fn pending_actions() -> &'static Mutex<HashMap<i64, PendingAction>> {
+    static PENDING_ACTIONS: OnceLock<Mutex<HashMap<i64, PendingAction>>> = OnceLock::new();
+    PENDING_ACTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_pending_action(chat_id: i64, action: PendingAction) {
+    if let Ok(mut guard) = pending_actions().lock() {
+        guard.insert(chat_id, action);
+    }
+}
+
+fn clear_pending_action(chat_id: i64) {
+    if let Ok(mut guard) = pending_actions().lock() {
+        guard.remove(&chat_id);
+    }
+}
+
+fn take_pending_action(chat_id: i64) -> Option<PendingAction> {
+    pending_actions()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.remove(&chat_id))
 }
 
 fn parse_unix_timestamp(value: &str) -> Option<i64> {

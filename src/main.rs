@@ -62,7 +62,10 @@ fn emit_progress(progress: Option<&dyn ProgressSink>, message: String) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     if let Err(err) = cleanup_expired_backups() {
-        eprintln!("advertencia: no se pudo aplicar la retencion de respaldos: {}", err);
+        eprintln!(
+            "advertencia: no se pudo aplicar la retencion de respaldos: {}",
+            err
+        );
     }
     match parse_args()? {
         AppMode::Help => {
@@ -94,7 +97,9 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
 
     if args.first().map(|s| s.as_str()) == Some("--restore") {
         if args.len() != 2 {
-            return Err("uso: he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>".into());
+            return Err(
+                "uso: he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>".into(),
+            );
         }
         return Ok(AppMode::Restore(args[1].clone()));
     }
@@ -120,7 +125,9 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
         Some("--report" | "--reporte" | "--html")
     ) {
         if args.len() != 2 {
-            return Err("uso: he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>".into());
+            return Err(
+                "uso: he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>".into(),
+            );
         }
         return Ok(AppMode::Report(args[1].clone()));
     }
@@ -130,9 +137,7 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
         Some("--convert-paths" | "--convertir-rutas" | "--windows-to-linux")
     ) {
         if args.len() != 3 {
-            return Err(
-                "uso: he1-unificar-pdfs --convert-paths <entrada.txt> <salida.txt>".into(),
-            );
+            return Err("uso: he1-unificar-pdfs --convert-paths <entrada.txt> <salida.txt>".into());
         }
         return Ok(AppMode::ConvertPaths {
             input: PathBuf::from(&args[1]),
@@ -171,7 +176,14 @@ fn run_process_mode(
     {
         run_directory_list(input, Some(label), progress)
     } else if input.is_dir() {
-        run_directories(vec![input.to_path_buf()], input, Some(label), &[], None, progress)
+        run_directories(
+            vec![input.to_path_buf()],
+            input,
+            Some(label),
+            &[],
+            None,
+            progress,
+        )
     } else {
         Err(format!(
             "la entrada debe ser una carpeta o un archivo .txt: {}",
@@ -210,7 +222,14 @@ fn run_directory_list(
         );
     }
 
-    run_directories(directories, list_file, label, &errors, Some(&stats), progress)
+    run_directories(
+        directories,
+        list_file,
+        label,
+        &errors,
+        Some(&stats),
+        progress,
+    )
 }
 
 fn run_directories(
@@ -225,7 +244,8 @@ fn run_directories(
     let log_path = log_root.join("Cambios.txt");
     println!("log registrado en: {}", log_path.display());
     let mut change_log = ChangeLog::new(&log_root)?;
-    let mut backup_session = RunBackupSession::new(source_label, &log_root, label, directory_stats)?;
+    let mut backup_session =
+        RunBackupSession::new(source_label, &log_root, label, directory_stats)?;
     let run_label = label.unwrap_or("sin_etiqueta");
 
     change_log.write_line(format!("INICIO corrida: {}", timestamp_now()))?;
@@ -243,10 +263,7 @@ fn run_directories(
             stats.errors
         ))?;
     }
-    change_log.write_line(format!(
-        "RESPALDO: {}",
-        backup_session.root.display()
-    ))?;
+    change_log.write_line(format!("RESPALDO: {}", backup_session.root.display()))?;
     emit_progress(
         progress,
         format!(
@@ -265,8 +282,7 @@ fn run_directories(
         for error in directory_errors {
             change_log.write_line(format!(
                 "OMITIDA linea {}: {}",
-                error.line_number,
-                error.message
+                error.line_number, error.message
             ))?;
         }
         emit_progress(
@@ -312,20 +328,13 @@ fn run_directories(
                     progress,
                     format!(
                         "carpeta {}/{} finalizada: {} grupo(s) consolidados, {} archivo(s) renombrado(s)",
-                        folder_number,
-                        total_folders,
-                        summary.merged_groups,
-                        summary.renamed_files
+                        folder_number, total_folders, summary.merged_groups, summary.renamed_files
                     ),
                 );
             }
             Err(err) => {
                 println!("error en carpeta {}: {}", folder.display(), err);
-                change_log.write_line(format!(
-                    "ERROR carpeta {}: {}",
-                    folder.display(),
-                    err
-                ))?;
+                change_log.write_line(format!("ERROR carpeta {}: {}", folder.display(), err))?;
                 emit_progress(
                     progress,
                     format!("error en carpeta {}: {}", folder.display(), err),
@@ -439,7 +448,11 @@ fn process_folder(
     folder_audit.write_line(format!("  PDFs encontrados: {}", pdf_count))?;
     emit_progress(
         progress,
-        format!("carpeta {}: {} PDF(s) detectados", folder.display(), pdf_count),
+        format!(
+            "carpeta {}: {} PDF(s) detectados",
+            folder.display(),
+            pdf_count
+        ),
     );
 
     for (file_name, base) in ignored_files {
@@ -779,14 +792,26 @@ fn print_usage() {
     println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("ejemplo:");
-    println!("  he1-unificar-pdfs --label folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
+    println!(
+        "  he1-unificar-pdfs --label folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001"
+    );
     println!("  he1-unificar-pdfs --restore folder_0001");
     println!("  he1-unificar-pdfs --report folder_0001");
-    println!("  he1-unificar-pdfs --check folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
-    println!("  he1-unificar-pdfs --convert-paths G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.linux.txt");
-    println!("  he1-unificar-pdfs --restore G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
-    println!("  he1-unificar-pdfs --report G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
-    println!("  he1-unificar-pdfs --check G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
+    println!(
+        "  he1-unificar-pdfs --check folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001"
+    );
+    println!(
+        "  he1-unificar-pdfs --convert-paths G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.linux.txt"
+    );
+    println!(
+        "  he1-unificar-pdfs --restore G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt"
+    );
+    println!(
+        "  he1-unificar-pdfs --report G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt"
+    );
+    println!(
+        "  he1-unificar-pdfs --check G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001"
+    );
     println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("comportamiento:");
@@ -808,13 +833,19 @@ fn print_usage() {
     println!("  - requiere TELEGRAM_BOT_TOKEN");
     println!("  - requiere TELEGRAM_CHAT_ID");
     println!("  - requiere HE1_INPUT para /process y /process_report");
-    println!("  - comandos: /process <etiqueta>, /process_report <etiqueta>, /restore <etiqueta>, /report <etiqueta>");
+    println!(
+        "  - comandos: /process <etiqueta>, /process_report <etiqueta>, /restore <etiqueta>, /report <etiqueta>"
+    );
     println!();
     println!("regla de nombres:");
     println!("  - acepta base.pdf");
     println!("  - acepta variantes base_*.pdf o base-*.pdf");
-    println!("  - tambien acepta nombres que se reducen al canonico por espacios, parentesis, corchetes, llaves o puntos");
-    println!("  - la comparacion no distingue mayusculas/minusculas; RHd-copia_extra.PDF puede entrar como RHD.pdf");
+    println!(
+        "  - tambien acepta nombres que se reducen al canonico por espacios, parentesis, corchetes, llaves o puntos"
+    );
+    println!(
+        "  - la comparacion no distingue mayusculas/minusculas; RHd-copia_extra.PDF puede entrar como RHD.pdf"
+    );
     println!("  - no acepta nombres pegados sin _ o - como PI13.pdf o AES4545.pdf");
 }
 
@@ -1061,7 +1092,10 @@ fn convert_directory_list_paths(
         return Err(format!("la entrada no es un archivo: {}", input.display()).into());
     }
     if paths_equivalent(input, output) {
-        println!("entrada y salida apuntan al mismo archivo: {}", output.display());
+        println!(
+            "entrada y salida apuntan al mismo archivo: {}",
+            output.display()
+        );
         return Ok(());
     }
 
@@ -1155,20 +1189,37 @@ impl BackupManifest {
     ) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(self.file, "stat\tlineas_totales\t{}", stats.total_lines)?;
         writeln!(self.file, "stat\tregistros_utiles\t{}", stats.useful_lines)?;
-        writeln!(self.file, "stat\tcarpetas_validas\t{}", stats.valid_directories)?;
-        writeln!(self.file, "stat\tduplicados_omitidos\t{}", stats.duplicate_directories)?;
+        writeln!(
+            self.file,
+            "stat\tcarpetas_validas\t{}",
+            stats.valid_directories
+        )?;
+        writeln!(
+            self.file,
+            "stat\tduplicados_omitidos\t{}",
+            stats.duplicate_directories
+        )?;
         writeln!(self.file, "stat\terrores\t{}", stats.errors)?;
         self.file.flush()?;
         Ok(())
     }
 
-    fn write_summary(
-        &mut self,
-        summary: &RunSummary,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        writeln!(self.file, "stat\tcarpetas_intentadas\t{}", summary.attempted_folders)?;
-        writeln!(self.file, "stat\tcarpetas_procesadas\t{}", summary.processed_folders)?;
-        writeln!(self.file, "stat\tgrupos_consolidados\t{}", summary.merged_groups)?;
+    fn write_summary(&mut self, summary: &RunSummary) -> Result<(), Box<dyn std::error::Error>> {
+        writeln!(
+            self.file,
+            "stat\tcarpetas_intentadas\t{}",
+            summary.attempted_folders
+        )?;
+        writeln!(
+            self.file,
+            "stat\tcarpetas_procesadas\t{}",
+            summary.processed_folders
+        )?;
+        writeln!(
+            self.file,
+            "stat\tgrupos_consolidados\t{}",
+            summary.merged_groups
+        )?;
         writeln!(self.file, "stat\tpdfs_candidatos\t{}", summary.merged_files)?;
         self.file.flush()?;
         Ok(())
@@ -1225,9 +1276,11 @@ impl RunBackupSession {
             validate_backup_label(label)?;
             storage_root.join(BACKUP_DIR_NAME).join(label)
         } else {
-            storage_root
-                .join(BACKUP_DIR_NAME)
-                .join(format!("run_{}_{}", timestamp_now(), std::process::id()))
+            storage_root.join(BACKUP_DIR_NAME).join(format!(
+                "run_{}_{}",
+                timestamp_now(),
+                std::process::id()
+            ))
         };
 
         if let Some(label) = label {
@@ -1336,11 +1389,7 @@ fn validate_backup_label(label: &str) -> Result<(), Box<dyn std::error::Error>> 
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
     {
-        return Err(format!(
-            "la etiqueta contiene caracteres no permitidos: {}",
-            label
-        )
-        .into());
+        return Err(format!("la etiqueta contiene caracteres no permitidos: {}", label).into());
     }
     Ok(())
 }
@@ -1379,11 +1428,7 @@ fn write_label_index(label: &str, manifest_path: &Path) -> Result<(), Box<dyn st
 fn resolve_manifest_from_label(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let index_path = label_index_path(label)?;
     if !index_path.exists() {
-        return Err(format!(
-            "no existe un respaldo indexado para la etiqueta: {}",
-            label
-        )
-        .into());
+        return Err(format!("no existe un respaldo indexado para la etiqueta: {}", label).into());
     }
 
     let file = File::open(&index_path)?;
@@ -1501,7 +1546,9 @@ fn cleanup_stale_label_indexes() -> Result<usize, Box<dyn std::error::Error>> {
     Ok(removed)
 }
 
-fn read_label_index_manifest_path(index_path: &Path) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+fn read_label_index_manifest_path(
+    index_path: &Path,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     let file = File::open(index_path)?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
@@ -1876,9 +1923,12 @@ fn report_path_from_target(target: &str) -> Result<PathBuf, Box<dyn std::error::
         return Err(format!("no se encontro manifest: {}", manifest_path.display()).into());
     }
 
-    let report_root = manifest_path
-        .parent()
-        .ok_or_else(|| format!("no se puede determinar la carpeta del manifest: {}", manifest_path.display()))?;
+    let report_root = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "no se puede determinar la carpeta del manifest: {}",
+            manifest_path.display()
+        )
+    })?;
     Ok(report_root.join("reporte_ecuador.html"))
 }
 
@@ -1894,11 +1944,18 @@ fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("manifest vacio: {}", manifest_path.display()).into());
     }
 
-    let original_paths: HashSet<PathBuf> =
-        manifest.backups.iter().map(|(original, _)| original.clone()).collect();
+    let original_paths: HashSet<PathBuf> = manifest
+        .backups
+        .iter()
+        .map(|(original, _)| original.clone())
+        .collect();
 
     for output in manifest.outputs {
-        if !original_paths.iter().any(|path| paths_equivalent(path, &output)) && output.exists() {
+        if !original_paths
+            .iter()
+            .any(|path| paths_equivalent(path, &output))
+            && output.exists()
+        {
             fs::remove_file(&output)?;
             println!("restauracion: eliminado generado {}", output.display());
         }
@@ -1926,10 +1983,7 @@ fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify_folder_processed(
-    target: &str,
-    folder: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_folder_processed(target: &str, folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let report = build_folder_verification_report(target, folder)?;
     println!("{}", report);
     Ok(())
@@ -2002,7 +2056,11 @@ pub(crate) fn build_folder_verification_report(
         .and_then(timestamp_to_ecuador)
         .unwrap_or_else(|| "no registrado".to_string());
     let execution_time = match (
-        manifest.header.timestamp.as_deref().and_then(parse_unix_timestamp),
+        manifest
+            .header
+            .timestamp
+            .as_deref()
+            .and_then(parse_unix_timestamp),
         finished_at_timestamp
             .as_deref()
             .and_then(parse_unix_timestamp),
@@ -2061,11 +2119,7 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
     let report_path = report_path_from_target(target)?;
 
     let manifest = read_manifest(&manifest_path)?;
-    let label_display = manifest
-        .header
-        .label
-        .as_deref()
-        .unwrap_or(target);
+    let label_display = manifest.header.label.as_deref().unwrap_or(target);
     let source_label_display = manifest
         .header
         .source_label
@@ -2091,7 +2145,11 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
         .and_then(timestamp_to_ecuador)
         .unwrap_or_else(|| "no registrado".to_string());
     let execution_time = match (
-        manifest.header.timestamp.as_deref().and_then(parse_unix_timestamp),
+        manifest
+            .header
+            .timestamp
+            .as_deref()
+            .and_then(parse_unix_timestamp),
         finished_at_timestamp
             .as_deref()
             .and_then(parse_unix_timestamp),
@@ -2099,7 +2157,8 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
         (Some(start), Some(end)) if end >= start => format_duration_seconds(end - start),
         _ => "no registrado".to_string(),
     };
-    let generated_at = timestamp_to_ecuador(&timestamp_now()).unwrap_or_else(|| "no registrado".to_string());
+    let generated_at =
+        timestamp_to_ecuador(&timestamp_now()).unwrap_or_else(|| "no registrado".to_string());
     let label_index = if let Some(label) = manifest.header.label.as_deref() {
         label_index_path(label)
             .ok()
@@ -2425,11 +2484,23 @@ mod tests {
 
     #[test]
     fn fuentes_txt_and_pdfs_use_project_root_as_storage_root() {
-        let txt_source = Path::new(r"G:\repo\fuentes_txt\PATH_DIRECTORIOS_1.txt");
-        let pdf_source = Path::new(r"G:\repo\pdfs\folder_0101");
+        #[cfg(windows)]
+        {
+            let txt_source = Path::new(r"G:\repo\fuentes_txt\PATH_DIRECTORIOS_1.txt");
+            let pdf_source = Path::new(r"G:\repo\pdfs\folder_0101");
 
-        assert_eq!(log_root_for(txt_source), PathBuf::from(r"G:\repo"));
-        assert_eq!(log_root_for(pdf_source), PathBuf::from(r"G:\repo"));
+            assert_eq!(log_root_for(txt_source), PathBuf::from(r"G:\repo"));
+            assert_eq!(log_root_for(pdf_source), PathBuf::from(r"G:\repo"));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let txt_source = Path::new("/repo/fuentes_txt/PATH_DIRECTORIOS_1.txt");
+            let pdf_source = Path::new("/repo/pdfs/folder_0101");
+
+            assert_eq!(log_root_for(txt_source), PathBuf::from("/repo"));
+            assert_eq!(log_root_for(pdf_source), PathBuf::from("/repo"));
+        }
     }
 
     #[test]
