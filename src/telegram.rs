@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_TIMEOUT_SECONDS: u64 = 30;
 const RETRY_DELAY_SECONDS: u64 = 5;
@@ -24,6 +25,11 @@ struct TelegramResponse<T> {
     result: Option<T>,
     description: Option<String>,
     error_code: Option<i64>,
+}
+
+struct TelegramHeartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +64,10 @@ enum TelegramCommand {
     },
     Report {
         target: String,
+    },
+    Check {
+        target: String,
+        folder: PathBuf,
     },
     Unknown(String),
 }
@@ -126,6 +136,50 @@ impl TelegramConfig {
     }
 }
 
+impl TelegramHeartbeat {
+    fn start(client: Client, config: TelegramConfig, label: String, input: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let start = Instant::now();
+            loop {
+                thread::sleep(Duration::from_secs(30));
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let elapsed_seconds = start.elapsed().as_secs() as i64;
+                let elapsed = super::format_duration_seconds(elapsed_seconds);
+                let message = format!(
+                    "Sigue procesando {label}\n\
+                     Entrada: {}\n\
+                     Transcurrido: {}",
+                    input.display(),
+                    elapsed
+                );
+
+                if let Err(err) = send_message(&client, &config, &message) {
+                    eprintln!("telegram heartbeat error: {}", err);
+                }
+            }
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for TelegramHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn handle_message(
     client: &Client,
     config: &TelegramConfig,
@@ -142,28 +196,10 @@ fn handle_message(
         }
         TelegramCommand::Process { label, input } => {
             let input_path = input.as_deref().unwrap_or(&config.default_input);
-            send_message(
-                client,
-                config,
-                &format!(
-                    "Procesando etiqueta {} con {} ...",
-                    label,
-                    input_path.display()
-                ),
-            )?;
             process_and_reply(client, config, &label, input_path, false)?;
         }
         TelegramCommand::ProcessReport { label, input } => {
             let input_path = input.as_deref().unwrap_or(&config.default_input);
-            send_message(
-                client,
-                config,
-                &format!(
-                    "Procesando y generando reporte para {} con {} ...",
-                    label,
-                    input_path.display()
-                ),
-            )?;
             process_and_reply(client, config, &label, input_path, true)?;
         }
         TelegramCommand::Restore { target } => {
@@ -190,6 +226,10 @@ fn handle_message(
                 "Reporte HTML generado",
             )?;
         }
+        TelegramCommand::Check { target, folder } => {
+            let report = super::build_folder_verification_report(&target, &folder)?;
+            send_message(client, config, &report)?;
+        }
         TelegramCommand::Unknown(text) => {
             send_message(
                 client,
@@ -209,7 +249,26 @@ fn process_and_reply(
     input: &Path,
     with_report: bool,
 ) -> Result<(), Box<dyn Error>> {
-    super::run_process_mode(input, label)?;
+    send_message(
+        client,
+        config,
+        &format!(
+            "Procesando etiqueta {} con {}\nTe avisare cada 30 segundos mientras siga corriendo.",
+            label,
+            input.display()
+        ),
+    )?;
+
+    let heartbeat = TelegramHeartbeat::start(
+        client.clone(),
+        config.clone(),
+        label.to_string(),
+        input.to_path_buf(),
+    );
+
+    let process_result = super::run_process_mode(input, label, None);
+    drop(heartbeat);
+    process_result?;
 
     let manifest_path = super::manifest_path_from_target(label)?;
     let manifest = super::read_manifest(&manifest_path)?;
@@ -359,6 +418,20 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
                 .to_string();
             TelegramCommand::Report { target }
         }
+        "/check" | "/verificar" => {
+            let target = parts
+                .next()
+                .ok_or("uso: /check <etiqueta | ruta_manifest_o_respaldo> <carpeta>")?
+                .to_string();
+            let folder = parts
+                .next()
+                .ok_or("uso: /check <etiqueta | ruta_manifest_o_respaldo> <carpeta>")?
+                .to_string();
+            TelegramCommand::Check {
+                target,
+                folder: PathBuf::from(folder),
+            }
+        }
         other if other.starts_with('/') => TelegramCommand::Unknown(other.to_string()),
         _ => return Err("el mensaje no es un comando de Telegram".into()),
     };
@@ -460,12 +533,15 @@ fn help_text() -> String {
         "/process_report <etiqueta> [ruta_input]",
         "/restore <etiqueta | ruta_manifest_o_respaldo>",
         "/report <etiqueta | ruta_manifest_o_respaldo>",
+        "/check <etiqueta | ruta_manifest_o_respaldo> <carpeta>",
         "/help",
         "",
         "Notas:",
         "- /process y /process_report usan HE1_INPUT si no indicas otra ruta.",
+        "- El bot envia avances resumidos por carpeta durante el proceso.",
         "- El bot solo responde al chat configurado en TELEGRAM_CHAT_ID.",
         "- El HTML se envia como archivo adjunto cuando se usa /process_report o /report.",
+        "- /check te dice desde Telegram si una carpeta aparece en el manifest y si conserva el marcador .he1_procesado.",
     ]
     .join("\n")
 }

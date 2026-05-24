@@ -63,6 +63,35 @@ En `process_report`, el contenedor ejecuta primero `process` y luego `report` us
 
 Dentro del contenedor, las rutas deben ser Linux. El repo del host se monta en `/work`.
 
+## Ejecucion nativa en Ubuntu 22
+
+Cuando ya no uses Docker, el flujo es mas simple:
+
+1. Copia `.env.ubuntu22.example` a `.env`.
+2. Ajusta `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
+3. Ajusta `HE1_INPUT` a la ruta real de tu repo en Ubuntu.
+4. Compila con `cargo build --release`.
+5. Ejecuta el binario con `HE1_MODE=telegram`, `process`, `process_report`, `restore` o `report` segun necesites.
+
+Ejemplos:
+
+- Procesar desde Telegram:
+  - `HE1_MODE=telegram`
+  - `HE1_LABEL=L112-L114`
+  - `HE1_INPUT=/home/usuario/rust_cambia_nombre_planillas_he1/fuentes_txt/PATH_DIRECTORIOS.txt`
+- Procesar y generar HTML:
+  - `HE1_MODE=process_report`
+  - `HE1_LABEL=L112-L114`
+  - `HE1_INPUT=/home/usuario/rust_cambia_nombre_planillas_he1/fuentes_txt/PATH_DIRECTORIOS.txt`
+- Restaurar:
+  - `HE1_MODE=restore`
+  - `HE1_TARGET=L112-L114`
+- Generar HTML:
+  - `HE1_MODE=report`
+  - `HE1_TARGET=L112-L114`
+
+En Ubuntu ya no necesitas `HOST_REPO` ni `WORKDIR` si corres el binario de forma nativa.
+
 ## Telegram local sin VPS
 
 El bot corre en el mismo equipo y usa `long polling`. No necesita IP publica ni webhook.

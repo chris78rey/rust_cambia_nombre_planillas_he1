@@ -24,6 +24,8 @@ enum AppMode {
     Process { input: PathBuf, label: String },
     Restore(String),
     Report(String),
+    Check { target: String, folder: PathBuf },
+    ConvertPaths { input: PathBuf, output: PathBuf },
     Telegram,
     Help,
 }
@@ -32,6 +34,7 @@ enum AppMode {
 struct FolderSummary {
     merged_groups: usize,
     merged_files: usize,
+    renamed_files: usize,
 }
 
 #[derive(Default)]
@@ -40,6 +43,17 @@ struct RunSummary {
     processed_folders: usize,
     merged_groups: usize,
     merged_files: usize,
+    renamed_files: usize,
+}
+
+pub trait ProgressSink {
+    fn note(&self, message: &str);
+}
+
+fn emit_progress(progress: Option<&dyn ProgressSink>, message: String) {
+    if let Some(progress) = progress {
+        progress.note(&message);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,8 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         AppMode::Restore(target) => restore_from_backup(&target),
         AppMode::Report(target) => generate_html_report(&target),
+        AppMode::Check { target, folder } => verify_folder_processed(&target, &folder),
+        AppMode::ConvertPaths { input, output } => convert_directory_list_paths(&input, &output),
         AppMode::Telegram => telegram::run(),
-        AppMode::Process { input, label } => run_process_mode(&input, &label),
+        AppMode::Process { input, label } => run_process_mode(&input, &label, None),
     }
 }
 
@@ -79,12 +95,43 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
 
     if matches!(
         args.first().map(|s| s.as_str()),
+        Some("--check" | "--verificar")
+    ) {
+        if args.len() != 3 {
+            return Err(
+                "uso: he1-unificar-pdfs --check <etiqueta | ruta_manifest_o_respaldo> <carpeta>"
+                    .into(),
+            );
+        }
+        return Ok(AppMode::Check {
+            target: args[1].clone(),
+            folder: PathBuf::from(&args[2]),
+        });
+    }
+
+    if matches!(
+        args.first().map(|s| s.as_str()),
         Some("--report" | "--reporte" | "--html")
     ) {
         if args.len() != 2 {
             return Err("uso: he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>".into());
         }
         return Ok(AppMode::Report(args[1].clone()));
+    }
+
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("--convert-paths" | "--convertir-rutas" | "--windows-to-linux")
+    ) {
+        if args.len() != 3 {
+            return Err(
+                "uso: he1-unificar-pdfs --convert-paths <entrada.txt> <salida.txt>".into(),
+            );
+        }
+        return Ok(AppMode::ConvertPaths {
+            input: PathBuf::from(&args[1]),
+            output: PathBuf::from(&args[2]),
+        });
     }
 
     if args.first().map(|s| s.as_str()) == Some("--label") {
@@ -100,7 +147,11 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
     Err("uso: he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>".into())
 }
 
-fn run_process_mode(input: &Path, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_process_mode(
+    input: &Path,
+    label: &str,
+    progress: Option<&dyn ProgressSink>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("ruta no existe: {}", input.display()).into());
     }
@@ -112,9 +163,9 @@ fn run_process_mode(input: &Path, label: &str) -> Result<(), Box<dyn std::error:
             .map(|s| s.eq_ignore_ascii_case("txt"))
             == Some(true)
     {
-        run_directory_list(input, Some(label))
+        run_directory_list(input, Some(label), progress)
     } else if input.is_dir() {
-        run_directories(vec![input.to_path_buf()], input, Some(label), &[], None)
+        run_directories(vec![input.to_path_buf()], input, Some(label), &[], None, progress)
     } else {
         Err(format!(
             "la entrada debe ser una carpeta o un archivo .txt: {}",
@@ -127,6 +178,7 @@ fn run_process_mode(input: &Path, label: &str) -> Result<(), Box<dyn std::error:
 fn run_directory_list(
     list_file: &Path,
     label: Option<&str>,
+    progress: Option<&dyn ProgressSink>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DirectoryListReadResult {
         directories,
@@ -142,9 +194,17 @@ fn run_directory_list(
             "se omitieron {} linea(s) con error; quedan registradas en el log",
             errors.len()
         );
+        emit_progress(
+            progress,
+            format!(
+                "archivo de directorios con {} linea(s) omitida(s): {}",
+                errors.len(),
+                list_file.display()
+            ),
+        );
     }
 
-    run_directories(directories, list_file, label, &errors, Some(&stats))
+    run_directories(directories, list_file, label, &errors, Some(&stats), progress)
 }
 
 fn run_directories(
@@ -153,12 +213,14 @@ fn run_directories(
     label: Option<&str>,
     directory_errors: &[DirectoryListError],
     directory_stats: Option<&DirectoryListStats>,
+    progress: Option<&dyn ProgressSink>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_root = log_root_for(source_label);
     let log_path = log_root.join("Cambios.txt");
     println!("log registrado en: {}", log_path.display());
     let mut change_log = ChangeLog::new(&log_root)?;
     let mut backup_session = RunBackupSession::new(source_label, &log_root, label, directory_stats)?;
+    let run_label = label.unwrap_or("sin_etiqueta");
 
     change_log.write_line(format!("INICIO corrida: {}", timestamp_now()))?;
     change_log.write_line(format!("FUENTE: {}", source_label.display()))?;
@@ -179,6 +241,16 @@ fn run_directories(
         "RESPALDO: {}",
         backup_session.root.display()
     ))?;
+    emit_progress(
+        progress,
+        format!(
+            "inicio corrida {} | fuente {} | carpetas {} | respaldo {}",
+            run_label,
+            source_label.display(),
+            directories.len(),
+            backup_session.root.display()
+        ),
+    );
     if !directory_errors.is_empty() {
         change_log.write_line(format!(
             "ARCHIVO DE DIRECTORIOS CON ERRORES: {}",
@@ -191,6 +263,13 @@ fn run_directories(
                 error.message
             ))?;
         }
+        emit_progress(
+            progress,
+            format!(
+                "archivo de directorios con {} error(es) omitidos",
+                directory_errors.len()
+            ),
+        );
     }
     change_log.write_line("FASE 1: unificacion por reglas canonicas")?;
 
@@ -199,12 +278,34 @@ fn run_directories(
         ..RunSummary::default()
     };
 
-    for folder in directories {
-        match process_folder(&folder, &mut change_log, &mut backup_session) {
+    let total_folders = directories.len();
+    for (index, folder) in directories.into_iter().enumerate() {
+        let folder_number = index + 1;
+        emit_progress(
+            progress,
+            format!(
+                "carpeta {}/{}: {}",
+                folder_number,
+                total_folders,
+                folder.display()
+            ),
+        );
+        match process_folder(&folder, &mut change_log, &mut backup_session, progress) {
             Ok(summary) => {
                 run_summary.merged_groups += summary.merged_groups;
                 run_summary.merged_files += summary.merged_files;
+                run_summary.renamed_files += summary.renamed_files;
                 run_summary.processed_folders += 1;
+                emit_progress(
+                    progress,
+                    format!(
+                        "carpeta {}/{} finalizada: {} grupo(s) consolidados, {} archivo(s) renombrado(s)",
+                        folder_number,
+                        total_folders,
+                        summary.merged_groups,
+                        summary.renamed_files
+                    ),
+                );
             }
             Err(err) => {
                 println!("error en carpeta {}: {}", folder.display(), err);
@@ -213,17 +314,27 @@ fn run_directories(
                     folder.display(),
                     err
                 ))?;
+                emit_progress(
+                    progress,
+                    format!("error en carpeta {}: {}", folder.display(), err),
+                );
             }
         }
     }
 
     println!(
-        "resumen: {} carpetas procesadas, {} grupos consolidados, {} PDFs candidatos",
-        run_summary.processed_folders, run_summary.merged_groups, run_summary.merged_files
+        "resumen: {} carpetas procesadas, {} grupos consolidados, {} PDFs candidatos, {} renombrados directos",
+        run_summary.processed_folders,
+        run_summary.merged_groups,
+        run_summary.merged_files,
+        run_summary.renamed_files
     );
     change_log.write_line(format!(
-        "RESUMEN: {} carpetas procesadas, {} grupos consolidados, {} PDFs candidatos",
-        run_summary.processed_folders, run_summary.merged_groups, run_summary.merged_files
+        "RESUMEN: {} carpetas procesadas, {} grupos consolidados, {} PDFs candidatos, {} renombrados directos",
+        run_summary.processed_folders,
+        run_summary.merged_groups,
+        run_summary.merged_files,
+        run_summary.renamed_files
     ))?;
     change_log.write_line(format!("FIN corrida: {}", timestamp_now()))?;
     backup_session.finish_with_summary(&run_summary)?;
@@ -235,6 +346,7 @@ fn process_folder(
     folder: &Path,
     change_log: &mut ChangeLog,
     backup_session: &mut RunBackupSession,
+    progress: Option<&dyn ProgressSink>,
 ) -> Result<FolderSummary, Box<dyn std::error::Error>> {
     if !folder.exists() {
         return Err(format!("la carpeta no existe: {}", folder.display()).into());
@@ -250,6 +362,10 @@ fn process_folder(
             "CARPETA OMITIDA (ya procesada): {}",
             folder.display()
         ))?;
+        emit_progress(
+            progress,
+            format!("carpeta omitida (ya procesada): {}", folder.display()),
+        );
         return Ok(FolderSummary::default());
     }
 
@@ -309,6 +425,10 @@ fn process_folder(
     println!("  PDFs encontrados: {}", pdf_count);
     change_log.write_line(format!("  PDFs encontrados: {}", pdf_count))?;
     folder_audit.write_line(format!("  PDFs encontrados: {}", pdf_count))?;
+    emit_progress(
+        progress,
+        format!("carpeta {}: {} PDF(s) detectados", folder.display(), pdf_count),
+    );
 
     for (file_name, base) in ignored_files {
         change_log.write_line(format!("  OBSERVADO: {} | base {}", file_name, base))?;
@@ -331,6 +451,15 @@ fn process_folder(
             folder_audit.write_line(format!("  base {} con {} archivos", base, files.len()))?;
             change_log.write_line(format!("    antes: {}", describe_files(&files)))?;
             folder_audit.write_line(format!("    antes: {}", describe_files(&files)))?;
+            emit_progress(
+                progress,
+                format!(
+                    "carpeta {}: base {} con {} archivo(s)",
+                    folder.display(),
+                    base,
+                    files.len()
+                ),
+            );
 
             let output = canonical_output_path(folder, base);
             if files.len() == 1 {
@@ -345,6 +474,15 @@ fn process_folder(
                     folder_audit.write_line(
                         "    accion: omitido para no reprocesar el archivo unificado",
                     )?;
+                    emit_progress(
+                        progress,
+                        format!(
+                            "carpeta {}: base {} ya consolidada en {}",
+                            folder.display(),
+                            base,
+                            output.display()
+                        ),
+                    );
                     continue;
                 }
 
@@ -361,6 +499,16 @@ fn process_folder(
                 change_log.write_line("    accion: renombrado directo sin union")?;
                 folder_audit.write_line(format!("    despues: {}", output.display()))?;
                 folder_audit.write_line("    accion: renombrado directo sin union")?;
+                summary.renamed_files += 1;
+                emit_progress(
+                    progress,
+                    format!(
+                        "carpeta {}: base {} renombrada a {}",
+                        folder.display(),
+                        base,
+                        output.display()
+                    ),
+                );
                 continue;
             }
 
@@ -410,6 +558,14 @@ fn process_folder(
                     "    ERROR verificacion fallo: paginas fuente={} paginas salida={}",
                     source_pages, merged_pages
                 ))?;
+                emit_progress(
+                    progress,
+                    format!(
+                        "carpeta {}: base {} con error de verificacion de paginas",
+                        folder.display(),
+                        base
+                    ),
+                );
                 return Err(format!(
                     "verificacion fallo para {}: paginas fuente={} paginas salida={}",
                     output.display(),
@@ -421,6 +577,14 @@ fn process_folder(
             if merged_size == 0 {
                 change_log.write_line("    ERROR verificacion fallo: bytes salida=0")?;
                 folder_audit.write_line("    ERROR verificacion fallo: bytes salida=0")?;
+                emit_progress(
+                    progress,
+                    format!(
+                        "carpeta {}: base {} con error de verificacion de bytes",
+                        folder.display(),
+                        base
+                    ),
+                );
                 return Err(format!(
                     "verificacion fallo para {}: bytes salida=0",
                     output.display()
@@ -470,6 +634,15 @@ fn process_folder(
             ))?;
             change_log.write_line("    estado: completado con exito")?;
             folder_audit.write_line("    estado: completado con exito")?;
+            emit_progress(
+                progress,
+                format!(
+                    "carpeta {}: base {} consolidada en {}",
+                    folder.display(),
+                    base,
+                    output.display()
+                ),
+            );
         }
 
         fs::write(
@@ -478,6 +651,15 @@ fn process_folder(
         )?;
         change_log.write_line(format!("MARCA CREADA: {}", processed_marker.display()))?;
         folder_audit.write_line(format!("MARCA CREADA: {}", processed_marker.display()))?;
+        emit_progress(
+            progress,
+            format!(
+                "carpeta finalizada: {} | grupos={} | archivos={}",
+                folder.display(),
+                summary.merged_groups,
+                summary.merged_files
+            ),
+        );
         Ok(())
     })();
 
@@ -580,25 +762,32 @@ fn print_usage() {
     println!("  he1-unificar-pdfs --label <etiqueta> <ruta.txt | carpeta>");
     println!("  he1-unificar-pdfs --restore <etiqueta | ruta_respaldo_o_manifest.txt>");
     println!("  he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>");
+    println!("  he1-unificar-pdfs --check <etiqueta | ruta_manifest_o_respaldo> <carpeta>");
+    println!("  he1-unificar-pdfs --convert-paths <entrada.txt> <salida.txt>");
     println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("ejemplo:");
     println!("  he1-unificar-pdfs --label folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
     println!("  he1-unificar-pdfs --restore folder_0001");
     println!("  he1-unificar-pdfs --report folder_0001");
+    println!("  he1-unificar-pdfs --check folder_0001 G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
+    println!("  he1-unificar-pdfs --convert-paths G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\fuentes_txt\\PATH_DIRECTORIOS.linux.txt");
     println!("  he1-unificar-pdfs --restore G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
     println!("  he1-unificar-pdfs --report G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt");
+    println!("  he1-unificar-pdfs --check G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\he1_respaldo\\run_...\\manifest.txt G:\\codex_projects\\rust_cambia_nombre_planillas_he1\\pdfs\\folder_0001");
     println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("comportamiento:");
     println!("  - si la entrada es .txt, cada linea valida se interpreta como carpeta");
     println!("  - si la entrada es carpeta, se procesa esa carpeta como unidad");
+    println!("  - --convert-paths crea una copia nueva con rutas Windows traducidas a Linux");
     println!("  - solo se procesan archivos PDF que cumplan la regla canonica");
     println!("  - los originales que se tocan se respaldan para poder restaurar");
     println!("  - la salida final queda en la misma carpeta original");
     println!("  - el respaldo se guarda en una carpeta visible he1_respaldo");
     println!("  - --restore reconstruye los originales y elimina los PDFs generados");
     println!("  - --report genera un HTML con la fecha de proceso en hora de Ecuador");
+    println!("  - --check verifica si una carpeta figura en el manifest y si conserva su marcador");
     println!("  - --telegram escucha comandos por Telegram desde este mismo equipo");
     println!("  - deja un log Cambios.txt con el detalle de la ejecucion");
     println!("  - documentacion de reglas: ver REGLA_UNIFICACION.md");
@@ -632,6 +821,18 @@ fn timestamp_to_ecuador(timestamp: &str) -> Option<String> {
         unix_seconds,
         ECUADOR_OFFSET_SECONDS,
     ))
+}
+
+fn system_time_to_unix_timestamp(time: SystemTime) -> Option<String> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_secs().to_string())
+}
+
+fn file_modified_timestamp(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_to_unix_timestamp)
 }
 
 fn parse_unix_timestamp(value: &str) -> Option<i64> {
@@ -835,6 +1036,30 @@ fn read_directory_list(
         errors,
         stats,
     })
+}
+
+fn convert_directory_list_paths(
+    input: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !input.exists() {
+        return Err(format!("la ruta no existe: {}", input.display()).into());
+    }
+    if !input.is_file() {
+        return Err(format!("la entrada no es un archivo: {}", input.display()).into());
+    }
+    if paths_equivalent(input, output) {
+        println!("entrada y salida apuntan al mismo archivo: {}", output.display());
+        return Ok(());
+    }
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::copy(input, output)?;
+    println!("archivo copiado en: {}", output.display());
+    Ok(())
 }
 
 struct ChangeLog {
@@ -1458,6 +1683,21 @@ fn read_manifest(manifest_path: &Path) -> Result<ManifestData, Box<dyn std::erro
     Ok(data)
 }
 
+fn resolved_manifest_completion_timestamp(
+    manifest_path: &Path,
+    manifest: &ManifestData,
+) -> (Option<String>, bool) {
+    if let Some(timestamp) = manifest.header.completed_at.clone() {
+        return (Some(timestamp), false);
+    }
+
+    if let Some(timestamp) = file_modified_timestamp(manifest_path) {
+        return (Some(timestamp), true);
+    }
+
+    (None, false)
+}
+
 #[derive(Default)]
 struct ManifestHeader {
     timestamp: Option<String>,
@@ -1562,6 +1802,136 @@ fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn verify_folder_processed(
+    target: &str,
+    folder: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = build_folder_verification_report(target, folder)?;
+    println!("{}", report);
+    Ok(())
+}
+
+pub(crate) fn build_folder_verification_report(
+    target: &str,
+    folder: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest_path = manifest_path_from_target(target)?;
+    if !manifest_path.exists() {
+        return Err(format!("no se encontro manifest: {}", manifest_path.display()).into());
+    }
+
+    if folder.exists() && !folder.is_dir() {
+        return Err(format!("la ruta no es una carpeta: {}", folder.display()).into());
+    }
+
+    let manifest = read_manifest(&manifest_path)?;
+    let folder_marker = folder.join(".he1_procesado");
+    let marker_exists = folder_marker.exists();
+    let folder_in_manifest = manifest
+        .folders
+        .iter()
+        .any(|entry| paths_equivalent(entry, folder));
+    let outputs_for_folder = manifest
+        .outputs
+        .iter()
+        .filter(|output| {
+            output
+                .parent()
+                .map(|parent| paths_equivalent(parent, folder))
+                .unwrap_or(false)
+        })
+        .count();
+    let backups_for_folder = manifest
+        .backups
+        .iter()
+        .filter(|(original, _)| {
+            original
+                .parent()
+                .map(|parent| paths_equivalent(parent, folder))
+                .unwrap_or(false)
+        })
+        .count();
+
+    let label_display = manifest.header.label.as_deref().unwrap_or(target);
+    let source_label_display = manifest
+        .header
+        .source_label
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no registrado".to_string());
+    let backup_root_display = manifest
+        .header
+        .backup_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no registrado".to_string());
+    let started_at = manifest
+        .header
+        .timestamp
+        .as_deref()
+        .and_then(timestamp_to_ecuador)
+        .unwrap_or_else(|| "no registrado".to_string());
+    let (finished_at_timestamp, finished_at_inferred) =
+        resolved_manifest_completion_timestamp(&manifest_path, &manifest);
+    let finished_at = finished_at_timestamp
+        .as_deref()
+        .and_then(timestamp_to_ecuador)
+        .unwrap_or_else(|| "no registrado".to_string());
+    let execution_time = match (
+        manifest.header.timestamp.as_deref().and_then(parse_unix_timestamp),
+        finished_at_timestamp
+            .as_deref()
+            .and_then(parse_unix_timestamp),
+    ) {
+        (Some(start), Some(end)) if end >= start => format_duration_seconds(end - start),
+        _ => "no registrado".to_string(),
+    };
+    let status = match (folder_in_manifest, marker_exists) {
+        (true, true) => "procesada y marcada",
+        (true, false) => "aparece en el manifest, pero hoy no conserva el marcador",
+        (false, true) => "tiene marcador, pero no aparece en el manifest de esta corrida",
+        (false, false) => "sin evidencia suficiente de procesamiento para esta etiqueta",
+    };
+
+    Ok([
+        "verificacion de proceso".to_string(),
+        format!("Etiqueta: {}", label_display),
+        format!("Manifest: {}", manifest_path.display()),
+        format!("Carpeta consultada: {}", folder.display()),
+        format!("Estado: {}", status),
+        format!(
+            "Marcador .he1_procesado: {}",
+            if marker_exists {
+                folder_marker.display().to_string()
+            } else {
+                "no encontrado".to_string()
+            }
+        ),
+        format!(
+            "Carpeta en manifest: {}",
+            if folder_in_manifest { "si" } else { "no" }
+        ),
+        format!("Salidas asociadas a la carpeta: {}", outputs_for_folder),
+        format!("Respaldos asociados a la carpeta: {}", backups_for_folder),
+        format!("Inicio Ecuador: {}", started_at),
+        format!("Fin Ecuador: {}", finished_at),
+        format!("Duracion total: {}", execution_time),
+        format!("Fuente original: {}", source_label_display),
+        format!("Respaldo raiz: {}", backup_root_display),
+        format!(
+            "Cierre de corrida: {}",
+            if finished_at_inferred {
+                "inferido desde la modificacion del manifest"
+            } else {
+                "registrado en completed_at"
+            }
+        ),
+        "Nota: si la carpeta fue restaurada, el marcador puede desaparecer aunque el manifest siga mostrando la corrida."
+            .to_string(),
+    ]
+    .join("\n"))
+}
+
 fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = manifest_path_from_target(target)?;
     let report_path = report_path_from_target(target)?;
@@ -1590,17 +1960,15 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
         .as_deref()
         .and_then(timestamp_to_ecuador)
         .unwrap_or_else(|| "no registrado".to_string());
-    let finished_at = manifest
-        .header
-        .completed_at
+    let (finished_at_timestamp, finished_at_inferred) =
+        resolved_manifest_completion_timestamp(&manifest_path, &manifest);
+    let finished_at = finished_at_timestamp
         .as_deref()
         .and_then(timestamp_to_ecuador)
         .unwrap_or_else(|| "no registrado".to_string());
     let execution_time = match (
         manifest.header.timestamp.as_deref().and_then(parse_unix_timestamp),
-        manifest
-            .header
-            .completed_at
+        finished_at_timestamp
             .as_deref()
             .and_then(parse_unix_timestamp),
     ) {
@@ -1661,6 +2029,11 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
         .pdfs_candidatos
         .map(|value| value.to_string())
         .unwrap_or_else(|| "no registrado".to_string());
+    let closing_note = if finished_at_inferred {
+        "El cierre se infirio desde la fecha de modificacion del manifest porque no quedo registrado completed_at."
+    } else {
+        "El cierre se tomo del footer completed_at del manifest."
+    };
 
     let html = format!(
         r#"<!doctype html>
@@ -1873,6 +2246,7 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
       </tr>
     </table>
 
+    <p class="foot">{closing_note}</p>
     <p class="foot">
       El archivo HTML se generó desde la informacion guardada por el programa y puede abrirse sin depender del binario.
     </p>
@@ -1901,6 +2275,7 @@ fn generate_html_report(target: &str) -> Result<(), Box<dyn std::error::Error>> 
         processed_folders = escape_html(&processed_folders),
         merged_groups = escape_html(&merged_groups),
         pdf_candidates = escape_html(&pdf_candidates),
+        closing_note = escape_html(closing_note),
     );
 
     fs::write(&report_path, html)?;
