@@ -6,7 +6,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod telegram;
 
@@ -18,6 +18,7 @@ const VALID_NAMES: &[&str] = &[
 
 const BACKUP_DIR_NAME: &str = "he1_respaldo";
 const LABEL_INDEX_DIR: &str = ".he1_label_index";
+const BACKUP_RETENTION_SECONDS: u64 = 2 * 24 * 60 * 60;
 
 #[derive(Debug)]
 enum AppMode {
@@ -48,6 +49,8 @@ struct RunSummary {
 
 pub trait ProgressSink {
     fn note(&self, message: &str);
+
+    fn update_folder_progress(&self, _current: usize, _total: usize) {}
 }
 
 fn emit_progress(progress: Option<&dyn ProgressSink>, message: String) {
@@ -58,6 +61,9 @@ fn emit_progress(progress: Option<&dyn ProgressSink>, message: String) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
+    if let Err(err) = cleanup_expired_backups() {
+        eprintln!("advertencia: no se pudo aplicar la retencion de respaldos: {}", err);
+    }
     match parse_args()? {
         AppMode::Help => {
             print_usage();
@@ -279,8 +285,14 @@ fn run_directories(
     };
 
     let total_folders = directories.len();
+    if let Some(progress) = progress {
+        progress.update_folder_progress(0, total_folders);
+    }
     for (index, folder) in directories.into_iter().enumerate() {
         let folder_number = index + 1;
+        if let Some(progress) = progress {
+            progress.update_folder_progress(folder_number, total_folders);
+        }
         emit_progress(
             progress,
             format!(
@@ -1342,6 +1354,10 @@ fn label_index_path(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> 
     Ok(label_index_dir()?.join(format!("{}.txt", label)))
 }
 
+fn backup_storage_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(env::current_dir()?.join(BACKUP_DIR_NAME))
+}
+
 fn write_label_index(label: &str, manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let index_path = label_index_path(label)?;
     if let Some(parent) = index_path.parent() {
@@ -1388,6 +1404,114 @@ fn resolve_manifest_from_label(label: &str) -> Result<PathBuf, Box<dyn std::erro
     }
 
     Err(format!("indice de etiqueta invalido: {}", index_path.display()).into())
+}
+
+pub(crate) fn cleanup_expired_backups() -> Result<(), Box<dyn std::error::Error>> {
+    let backup_root = backup_storage_root()?;
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(BACKUP_RETENTION_SECONDS))
+        .unwrap_or(UNIX_EPOCH);
+    let mut removed_backups = 0usize;
+
+    if backup_root.exists() {
+        for entry in fs::read_dir(&backup_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if is_backup_expired(&path, cutoff) {
+                if is_safe_backup_path(&backup_root, &path) {
+                    fs::remove_dir_all(&path)?;
+                    removed_backups += 1;
+                    eprintln!("retencion: eliminado respaldo antiguo {}", path.display());
+                } else {
+                    eprintln!(
+                        "retencion: se omite una ruta sospechosa fuera del respaldo base: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    let removed_indexes = cleanup_stale_label_indexes()?;
+    if removed_backups > 0 || removed_indexes > 0 {
+        eprintln!(
+            "retencion: limpieza completada (respaldos eliminados={}, indices eliminados={})",
+            removed_backups, removed_indexes
+        );
+    }
+
+    Ok(())
+}
+
+fn is_backup_expired(path: &Path, cutoff: SystemTime) -> bool {
+    backup_entry_modified_time(path)
+        .map(|modified| modified <= cutoff)
+        .unwrap_or(false)
+}
+
+fn backup_entry_modified_time(path: &Path) -> Option<SystemTime> {
+    let manifest_path = path.join("manifest.txt");
+    let metadata = if manifest_path.exists() {
+        fs::metadata(manifest_path).ok()
+    } else {
+        fs::metadata(path).ok()
+    }?;
+
+    metadata.modified().ok()
+}
+
+fn is_safe_backup_path(base: &Path, candidate: &Path) -> bool {
+    match (fs::canonicalize(base), fs::canonicalize(candidate)) {
+        (Ok(base), Ok(candidate)) => candidate.starts_with(base),
+        _ => false,
+    }
+}
+
+fn cleanup_stale_label_indexes() -> Result<usize, Box<dyn std::error::Error>> {
+    let index_dir = label_index_dir()?;
+    if !index_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&index_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let manifest_exists = match read_label_index_manifest_path(&path) {
+            Ok(Some(manifest_path)) => manifest_path.exists(),
+            _ => false,
+        };
+
+        if !manifest_exists {
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+                eprintln!("retencion: eliminado indice obsoleto {}", path.display());
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn read_label_index_manifest_path(index_path: &Path) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let file = File::open(index_path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(rest) = line.strip_prefix("manifest=") {
+            return Ok(Some(PathBuf::from(rest)));
+        }
+    }
+
+    Ok(None)
 }
 
 fn detect_group_base(stem: &str) -> Option<&'static str> {

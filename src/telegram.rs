@@ -5,12 +5,16 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_TIMEOUT_SECONDS: u64 = 30;
 const RETRY_DELAY_SECONDS: u64 = 5;
+const BACKUP_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 
 #[derive(Debug, Clone)]
 struct TelegramConfig {
@@ -30,6 +34,16 @@ struct TelegramResponse<T> {
 struct TelegramHeartbeat {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct BackupCleanupWorker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct TelegramProgressTracker {
+    current_folder: Arc<AtomicUsize>,
+    total_folders: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +92,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .timeout(Duration::from_secs(120))
         .build()?;
     let mut offset: i64 = 0;
+    let _cleanup_worker = BackupCleanupWorker::start();
 
     eprintln!(
         "telegram activo: chat_id={}, input por defecto={}",
@@ -137,7 +152,14 @@ impl TelegramConfig {
 }
 
 impl TelegramHeartbeat {
-    fn start(client: Client, config: TelegramConfig, label: String, input: PathBuf) -> Self {
+    fn start(
+        client: Client,
+        config: TelegramConfig,
+        label: String,
+        input: PathBuf,
+        current_folder: Arc<AtomicUsize>,
+        total_folders: Arc<AtomicUsize>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
@@ -150,11 +172,20 @@ impl TelegramHeartbeat {
 
                 let elapsed_seconds = start.elapsed().as_secs() as i64;
                 let elapsed = super::format_duration_seconds(elapsed_seconds);
+                let current = current_folder.load(Ordering::SeqCst);
+                let total = total_folders.load(Ordering::SeqCst);
+                let folder_progress = if total > 0 {
+                    format!("Carpetas: {}/{}", current, total)
+                } else {
+                    "Carpetas: no registradas".to_string()
+                };
                 let message = format!(
                     "Sigue procesando {label}\n\
                      Entrada: {}\n\
+                     {}\n\
                      Transcurrido: {}",
                     input.display(),
+                    folder_progress,
                     elapsed
                 );
 
@@ -177,6 +208,67 @@ impl Drop for TelegramHeartbeat {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl BackupCleanupWorker {
+    fn start() -> Self {
+        if let Err(err) = super::cleanup_expired_backups() {
+            eprintln!("telegram retention error inicial: {}", err);
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(BACKUP_CLEANUP_INTERVAL_SECONDS));
+            if thread_stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if let Err(err) = super::cleanup_expired_backups() {
+                eprintln!("telegram retention error: {}", err);
+            }
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for BackupCleanupWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl TelegramProgressTracker {
+    fn new() -> Self {
+        Self {
+            current_folder: Arc::new(AtomicUsize::new(0)),
+            total_folders: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn current_folder(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.current_folder)
+    }
+
+    fn total_folders(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.total_folders)
+    }
+}
+
+impl super::ProgressSink for TelegramProgressTracker {
+    fn note(&self, _message: &str) {}
+
+    fn update_folder_progress(&self, current: usize, total: usize) {
+        self.current_folder.store(current, Ordering::SeqCst);
+        self.total_folders.store(total, Ordering::SeqCst);
     }
 }
 
@@ -259,14 +351,17 @@ fn process_and_reply(
         ),
     )?;
 
+    let progress_tracker = TelegramProgressTracker::new();
     let heartbeat = TelegramHeartbeat::start(
         client.clone(),
         config.clone(),
         label.to_string(),
         input.to_path_buf(),
+        progress_tracker.current_folder(),
+        progress_tracker.total_folders(),
     );
 
-    let process_result = super::run_process_mode(input, label, None);
+    let process_result = super::run_process_mode(input, label, Some(&progress_tracker));
     drop(heartbeat);
     process_result?;
 
