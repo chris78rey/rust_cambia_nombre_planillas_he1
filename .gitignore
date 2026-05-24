@@ -12,3 +12,8 @@ he1_respaldo/
 fuentes_txt/*.txt
 fuentes_txt/.he1_respaldo/
 fuentes_txt/_restore_*_manifest.txt
+
+# Artefactos locales y logs ad hoc
+repomix-output.xml
+telegram*.log
+fuentes_txt/tele
