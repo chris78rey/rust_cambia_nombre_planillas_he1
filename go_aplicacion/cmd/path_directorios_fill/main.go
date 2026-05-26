@@ -222,7 +222,12 @@ func fetchOracleValues(ctx context.Context, db *sql.DB, schema, table, field, va
 		return nil, fmt.Errorf("invalid Oracle table: %w", err)
 	}
 
-	query := fmt.Sprintf(`SELECT DISTINCT DIG_TRAMITE FROM %s.%s WHERE %s = :1`, oracleIdent(schema), oracleIdent(table), oracleIdent(field))
+	query := fmt.Sprintf(
+		`SELECT DISTINCT DIG_TRAMITE FROM %s.%s WHERE %s = :1 AND DIG_PLANILLADO = 'S'`,
+		oracleIdent(schema),
+		oracleIdent(table),
+		oracleIdent(field),
+	)
 	rows, err := db.QueryContext(ctx, query, value)
 	if err != nil {
 		return nil, err

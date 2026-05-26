@@ -393,13 +393,11 @@ fn process_folder(
     println!("analizando carpeta: {}", folder.display());
     change_log.write_line(format!("CARPETA: {}", folder.display()))?;
     backup_session.record_folder(folder)?;
-    let mut folder_audit = FolderAudit::new(folder)?;
+    let folder_work_root = backup_session.work_dir_for(folder);
+    let mut folder_audit = FolderAudit::new(&folder_work_root)?;
     folder_audit.write_line(format!("AUDITORIA: {}", folder.display()))?;
     folder_audit.write_line(format!("INICIO: {}", timestamp_now()))?;
-    folder_audit.write_line(format!(
-        "RUTA_AUX: {}",
-        folder.join(".he1_aux_temporal").display()
-    ))?;
+    folder_audit.write_line(format!("RUTA_TRABAJO: {}", folder_work_root.display()))?;
 
     let mut pdf_files = Vec::new();
     let mut pdf_count = 0usize;
@@ -487,9 +485,51 @@ fn process_folder(
             );
 
             let output = canonical_output_path(folder, base);
+            let (files, case_only_duplicates) = split_case_variant_duplicates(files, &output);
+            if !case_only_duplicates.is_empty() {
+                change_log.write_line(format!(
+                    "    duplicados de casing detectados: {}",
+                    describe_files(&case_only_duplicates)
+                ))?;
+                folder_audit.write_line(format!(
+                    "    duplicados de casing detectados: {}",
+                    describe_files(&case_only_duplicates)
+                ))?;
+            }
+            let mut managed_files = files.clone();
+            managed_files.extend(case_only_duplicates.iter().cloned());
+
             if files.len() == 1 {
                 let source = &files[0];
                 if paths_equivalent(source, &output) {
+                    if !case_only_duplicates.is_empty() {
+                        for path in &case_only_duplicates {
+                            backup_path_if_needed(backup_session, &mut folder_backups, path)?;
+                        }
+                        delete_sources(&managed_files, &output)?;
+                        println!(
+                            "  base {} conservada en {} y duplicados de casing eliminados",
+                            base,
+                            output.display()
+                        );
+                        change_log.write_line(format!("    despues: {}", output.display()))?;
+                        change_log.write_line(
+                            "    accion: conservado archivo canonico y eliminados duplicados de casing",
+                        )?;
+                        folder_audit.write_line(format!("    despues: {}", output.display()))?;
+                        folder_audit.write_line(
+                            "    accion: conservado archivo canonico y eliminados duplicados de casing",
+                        )?;
+                        emit_progress(
+                            progress,
+                            format!(
+                                "carpeta {}: base {} conservada en {} y duplicados de casing eliminados",
+                                folder.display(),
+                                base,
+                                output.display()
+                            ),
+                        );
+                    }
                     println!("  base {} ya consolidada en {}", base, output.display());
                     change_log.write_line(format!("    despues: {}", output.display()))?;
                     folder_audit.write_line(format!("    despues: {}", output.display()))?;
@@ -513,7 +553,9 @@ fn process_folder(
 
                 backup_session.record_output(&output)?;
                 folder_outputs.insert(output.clone());
-                backup_path_if_needed(backup_session, &mut folder_backups, source)?;
+                for path in &managed_files {
+                    backup_path_if_needed(backup_session, &mut folder_backups, path)?;
+                }
                 if output.exists() {
                     backup_path_if_needed(backup_session, &mut folder_backups, &output)?;
                     fs::remove_file(&output)?;
@@ -552,14 +594,14 @@ fn process_folder(
 
             backup_session.record_output(&output)?;
             folder_outputs.insert(output.clone());
-            for path in &files {
+            for path in &managed_files {
                 backup_path_if_needed(backup_session, &mut folder_backups, path)?;
             }
             if output.exists() && !files.iter().any(|p| paths_equivalent(p, &output)) {
                 backup_path_if_needed(backup_session, &mut folder_backups, &output)?;
             }
 
-            let aux_dir = folder.join(".he1_aux_temporal").join(base);
+            let aux_dir = folder_work_root.join(base);
             fs::create_dir_all(&aux_dir)?;
             let aux_paths = build_aux_paths(&files, &aux_dir)?;
             copy_to_aux(&files, &aux_paths)?;
@@ -617,7 +659,7 @@ fn process_folder(
                 .into());
             }
 
-            delete_sources(&files, &output)?;
+            delete_sources(&managed_files, &output)?;
             cleanup_aux(&aux_paths)?;
             if aux_dir.exists() && aux_dir.read_dir()?.next().is_none() {
                 fs::remove_dir_all(&aux_dir)?;
@@ -738,19 +780,21 @@ fn restore_folder_state(
         fs::copy(&backup, original)?;
     }
 
-    cleanup_generated_artifacts(folder)?;
+    cleanup_generated_artifacts(folder, &backup_session.work_dir_for(folder))?;
     Ok(())
 }
 
-fn cleanup_generated_artifacts(folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cleanup_generated_artifacts(
+    folder: &Path,
+    work_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let processed_marker = folder.join(".he1_procesado");
     if processed_marker.exists() {
         fs::remove_file(processed_marker)?;
     }
 
-    let aux_dir = folder.join(".he1_aux_temporal");
-    if aux_dir.exists() {
-        for entry in fs::read_dir(&aux_dir)? {
+    if work_dir.exists() {
+        for entry in fs::read_dir(work_dir)? {
             let entry = entry?;
             let path = entry.path();
             let keep_audit = path.file_name().and_then(|s| s.to_str()) == Some("auditoria.txt");
@@ -1133,7 +1177,7 @@ struct FolderAudit {
 
 impl FolderAudit {
     fn new(folder: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let audit_dir = folder.join(".he1_aux_temporal");
+        let audit_dir = folder.to_path_buf();
         fs::create_dir_all(&audit_dir)?;
         let audit_path = audit_dir.join("auditoria.txt");
         let file = OpenOptions::new()
@@ -1171,6 +1215,7 @@ impl BackupManifest {
         &mut self,
         source_label: &Path,
         backup_root: &Path,
+        work_root: &Path,
         label: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(self.file, "timestamp={}", timestamp_now())?;
@@ -1179,6 +1224,7 @@ impl BackupManifest {
         }
         writeln!(self.file, "source_label={}", source_label.display())?;
         writeln!(self.file, "backup_root={}", backup_root.display())?;
+        writeln!(self.file, "work_root={}", work_root.display())?;
         self.file.flush()?;
         Ok(())
     }
@@ -1261,6 +1307,7 @@ impl BackupManifest {
 
 struct RunBackupSession {
     root: PathBuf,
+    work_root: PathBuf,
     manifest: BackupManifest,
     copied_paths: HashSet<PathBuf>,
 }
@@ -1272,16 +1319,21 @@ impl RunBackupSession {
         label: Option<&str>,
         directory_stats: Option<&DirectoryListStats>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let run_root = if let Some(label) = label {
+        let run_id = if let Some(label) = label {
             validate_backup_label(label)?;
+            label.to_string()
+        } else {
+            format!("run_{}_{}", timestamp_now(), std::process::id())
+        };
+        let run_root = if let Some(label) = label {
             storage_root.join(BACKUP_DIR_NAME).join(label)
         } else {
-            storage_root.join(BACKUP_DIR_NAME).join(format!(
-                "run_{}_{}",
-                timestamp_now(),
-                std::process::id()
-            ))
+            storage_root.join(BACKUP_DIR_NAME).join(&run_id)
         };
+        let work_root = storage_root
+            .join(BACKUP_DIR_NAME)
+            .join("area_trabajo")
+            .join(&run_id);
 
         if let Some(label) = label {
             if label_index_path(label)?.exists() {
@@ -1296,7 +1348,7 @@ impl RunBackupSession {
         }
 
         let mut manifest = BackupManifest::new(&run_root)?;
-        manifest.write_header(source_label, &run_root, label)?;
+        manifest.write_header(source_label, &run_root, &work_root, label)?;
         if let Some(stats) = directory_stats {
             manifest.write_source_stats(stats)?;
         }
@@ -1309,6 +1361,7 @@ impl RunBackupSession {
 
         Ok(Self {
             root: run_root,
+            work_root,
             manifest,
             copied_paths: HashSet::new(),
         })
@@ -1316,6 +1369,10 @@ impl RunBackupSession {
 
     fn backup_path_for(&self, original: &Path) -> PathBuf {
         self.root.join("items").join(backup_relative_path(original))
+    }
+
+    fn work_dir_for(&self, folder: &Path) -> PathBuf {
+        self.work_root.join(backup_relative_path(folder))
     }
 
     fn record_folder(&mut self, folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1598,6 +1655,42 @@ fn collect_base_files(files: &[PathBuf], base: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn split_case_variant_duplicates(
+    files: Vec<PathBuf>,
+    output: &Path,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let Some(output_name) = output.file_name().and_then(|s| s.to_str()) else {
+        return (files, Vec::new());
+    };
+
+    if !files.iter().any(|path| paths_equivalent(path, output)) {
+        return (files, Vec::new());
+    }
+
+    let mut kept = Vec::with_capacity(files.len());
+    let mut duplicates = Vec::new();
+
+    for path in files {
+        if paths_equivalent(&path, output) {
+            kept.push(path);
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            kept.push(path);
+            continue;
+        };
+
+        if name.eq_ignore_ascii_case(output_name) {
+            duplicates.push(path);
+        } else {
+            kept.push(path);
+        }
+    }
+
+    (kept, duplicates)
+}
+
 fn describe_files(files: &[PathBuf]) -> String {
     files
         .iter()
@@ -1816,6 +1909,8 @@ fn read_manifest(manifest_path: &Path) -> Result<ManifestData, Box<dyn std::erro
             data.header.source_label = Some(PathBuf::from(rest));
         } else if let Some(rest) = line.strip_prefix("backup_root=") {
             data.header.backup_root = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("work_root=") {
+            data.header.work_root = Some(PathBuf::from(rest));
         } else if let Some(rest) = line.strip_prefix("stat\t") {
             let mut parts = rest.splitn(2, '\t');
             let key = parts.next().unwrap_or_default();
@@ -1876,6 +1971,7 @@ struct ManifestHeader {
     label: Option<String>,
     source_label: Option<PathBuf>,
     backup_root: Option<PathBuf>,
+    work_root: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -1976,7 +2072,13 @@ fn restore_from_backup(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for folder in manifest.folders {
-        cleanup_generated_artifacts(&folder)?;
+        let work_dir = manifest
+            .header
+            .work_root
+            .as_ref()
+            .map(|root| root.join(backup_relative_path(&folder)))
+            .unwrap_or_else(|| folder.join(".he1_aux_temporal"));
+        cleanup_generated_artifacts(&folder, &work_dir)?;
     }
 
     println!("restauracion completada desde {}", manifest_path.display());
