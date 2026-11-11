@@ -1,11 +1,14 @@
 use lopdf::Document;
-use std::collections::{BTreeMap, HashSet};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod telegram;
@@ -27,6 +30,8 @@ enum AppMode {
     Report(String),
     Check { target: String, folder: PathBuf },
     ConvertPaths { input: PathBuf, output: PathBuf },
+    Objections { label: String, dry_run: bool },
+    RetryObjectionRefresh,
     Telegram,
     Help,
 }
@@ -47,6 +52,199 @@ struct RunSummary {
     renamed_files: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct ObjectionDbPlan {
+    label: String,
+    items: Vec<ObjectionDbPlanItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectionDbPlanItem {
+    id_descarga: String,
+    tramite: String,
+    nombre_pdf: String,
+    #[serde(default)]
+    folder_paths: Vec<String>,
+    #[serde(default)]
+    folder_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectionMergePlan {
+    tramite: String,
+    folder: PathBuf,
+    base: String,
+    part_paths: Vec<PathBuf>,
+    unrequested_part_paths: Vec<PathBuf>,
+    cleanup_paths: Vec<PathBuf>,
+    input_paths: Vec<PathBuf>,
+    source_snapshots: Vec<ObjectionSourceSnapshot>,
+    unrequested_snapshots: Vec<ObjectionSourceSnapshot>,
+    output_path: PathBuf,
+    total_pages: u32,
+    db_groups: Vec<ObjectionDbChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionSourceSnapshot {
+    filename: String,
+    path: String,
+    size_bytes: u64,
+    pages: u32,
+    modified_unix_seconds: Option<u64>,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionPreviewReport {
+    label: String,
+    groups: Vec<ObjectionPreviewGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionPreviewGroup {
+    tramite: String,
+    document: String,
+    destination: String,
+    total_pages: u32,
+    oracle_items: Vec<ObjectionPreviewOracleItem>,
+    source_files: Vec<ObjectionSourceSnapshot>,
+    unrequested_files: Vec<ObjectionSourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionPreviewOracleItem {
+    id_descarga: String,
+    source_names: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ObjectionExecutionPlan {
+    helper: PathBuf,
+    plans: Vec<ObjectionMergePlan>,
+    report: ObjectionPreviewReport,
+    fingerprint: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct TelegramObjectionPreview {
+    pub(crate) label: String,
+    pub(crate) fingerprint: String,
+    pub(crate) report_path: PathBuf,
+    pub(crate) groups: usize,
+    pub(crate) pages: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum TelegramObjectionApply {
+    Applied {
+        summary: String,
+        manifest_path: PathBuf,
+        report_path: PathBuf,
+    },
+    PlanChanged(TelegramObjectionPreview),
+}
+
+#[derive(Debug)]
+struct ObjectionApplyOutcome {
+    summary: String,
+    manifest_path: PathBuf,
+    report_path: PathBuf,
+}
+
+enum ObjectionRunOutcome {
+    NoGroups,
+    DryRun,
+    PlanChanged(TelegramObjectionPreview),
+    Applied(ObjectionApplyOutcome),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionDbChange {
+    id_descarga: String,
+    tramite: String,
+    base: String,
+    canonical_name: String,
+    part_names: Vec<String>,
+    output_path: String,
+    total_pages: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectionDbApplyRequest {
+    label: String,
+    groups: Vec<ObjectionDbChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectionDbApplyResponse {
+    status: String,
+    message: Option<String>,
+    groups_updated: usize,
+    items_deleted: i64,
+    downloads_updated: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingObjectionRefresh {
+    label: String,
+    tramite: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionJournal {
+    operation_id: String,
+    label: String,
+    plan_fingerprint: String,
+    pre_merge_report: String,
+    pre_merge_report_sha256: String,
+    state: String,
+    groups: Vec<ObjectionJournalGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectionJournalGroup {
+    tramite: String,
+    base: String,
+    output_path: String,
+    temporary_path: String,
+    part_paths: Vec<String>,
+    unrequested_part_paths: Vec<String>,
+    cleanup_paths: Vec<String>,
+    input_paths: Vec<String>,
+    source_snapshots: Vec<ObjectionSourceSnapshot>,
+    unrequested_snapshots: Vec<ObjectionSourceSnapshot>,
+    previous_output_backup: Option<String>,
+    total_pages: u32,
+    output_size_bytes: u64,
+    output_sha256: String,
+}
+
+#[derive(Debug)]
+struct ObjectionFileMutation {
+    output_path: PathBuf,
+    temporary_path: PathBuf,
+    previous_output_backup: Option<PathBuf>,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct ObjectionTempCleanup(Vec<PathBuf>);
+
+impl ObjectionTempCleanup {
+    fn track(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+}
+
+impl Drop for ObjectionTempCleanup {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub trait ProgressSink {
     fn note(&self, message: &str);
 
@@ -61,13 +259,18 @@ fn emit_progress(progress: Option<&dyn ProgressSink>, message: String) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    if let Err(err) = cleanup_expired_backups() {
-        eprintln!(
-            "advertencia: no se pudo aplicar la retencion de respaldos: {}",
-            err
-        );
-    }
     let mode = parse_args()?;
+    if !matches!(
+        &mode,
+        AppMode::Objections { dry_run: true, .. } | AppMode::RetryObjectionRefresh
+    ) {
+        if let Err(err) = cleanup_expired_backups() {
+            eprintln!(
+                "advertencia: no se pudo aplicar la retencion de respaldos: {}",
+                err
+            );
+        }
+    }
     let result = match &mode {
         AppMode::Help => {
             print_usage();
@@ -77,6 +280,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         AppMode::Report(target) => generate_html_report(target),
         AppMode::Check { target, folder } => verify_folder_processed(target, folder),
         AppMode::ConvertPaths { input, output } => convert_directory_list_paths(input, output),
+        AppMode::Objections { label, dry_run } => run_objection_mode(label, *dry_run),
+        AppMode::RetryObjectionRefresh => retry_pending_objection_refreshes(),
         AppMode::Telegram => telegram::run(),
         AppMode::Process { input, label } => run_process_mode(input, label, None),
     };
@@ -99,6 +304,40 @@ fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
 
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok(AppMode::Help);
+    }
+
+    if args.first().map(String::as_str) == Some("--modo") {
+        if args.get(1).map(String::as_str) != Some("objeciones") {
+            return Err("modo no válido; opciones: objeciones".into());
+        }
+        let mut label: Option<String> = None;
+        let mut dry_run = false;
+        let mut retry_refresh = false;
+        let mut index = 2;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--label" => {
+                    index += 1;
+                    let value = args.get(index).ok_or("falta valor para --label")?;
+                    label = Some(value.clone());
+                }
+                "--dry-run" => dry_run = true,
+                "--reintentar-refresh" | "--retry-refresh" => retry_refresh = true,
+                unknown => {
+                    return Err(format!("opción desconocida para objeciones: {}", unknown).into());
+                }
+            }
+            index += 1;
+        }
+        if retry_refresh {
+            if label.is_some() || dry_run {
+                return Err("--reintentar-refresh se usa sin --label ni --dry-run".into());
+            }
+            return Ok(AppMode::RetryObjectionRefresh);
+        }
+        let label = label.ok_or("falta --label <etiqueta_objecion>")?;
+        validate_backup_label(&label)?;
+        return Ok(AppMode::Objections { label, dry_run });
     }
 
     if args.first().map(|s| s.as_str()) == Some("--telegram") {
@@ -204,6 +443,1181 @@ fn run_process_mode(
         )
         .into())
     }
+}
+
+fn run_objection_mode(label: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_objection_mode_checked(label, dry_run, None)?;
+    Ok(())
+}
+
+fn run_objection_mode_checked(
+    label: &str,
+    dry_run: bool,
+    expected_fingerprint: Option<&str>,
+) -> Result<ObjectionRunOutcome, Box<dyn std::error::Error>> {
+    let execution = build_objection_execution_plan(label)?;
+    let helper = execution.helper.clone();
+    let plans = execution.plans;
+    let report = execution.report;
+    let fingerprint = execution.fingerprint;
+    if plans.is_empty() {
+        println!(
+            "La etiqueta {} no contiene grupos PDF fraccionados elegibles.",
+            label
+        );
+        return Ok(ObjectionRunOutcome::NoGroups);
+    }
+
+    if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+        let preview = write_telegram_objection_preview(label, &report, &fingerprint)?;
+        return Ok(ObjectionRunOutcome::PlanChanged(preview));
+    }
+
+    println!(
+        "Objeción {}: {} grupo(s) para consolidar",
+        label,
+        plans.len()
+    );
+    for plan in &plans {
+        println!(
+            "  trámite {} | {} | {} parte(s) + PDF canónico existente si aplica | {} página(s) -> {}",
+            plan.tramite,
+            plan.base,
+            plan.part_paths.len(),
+            plan.total_pages,
+            plan.output_path.display()
+        );
+        println!("    partes: {}", describe_files(&plan.part_paths));
+        if !plan.unrequested_part_paths.is_empty() {
+            println!(
+                "    partes fuera de esta etiqueta (se dejan intactas): {}",
+                describe_files(&plan.unrequested_part_paths)
+            );
+        }
+    }
+    if dry_run {
+        println!("Simulación: no se modificaron PDFs, Oracle ni caché.");
+        return Ok(ObjectionRunOutcome::DryRun);
+    }
+
+    let refresh_template = objection_refresh_template()?;
+    let refresh_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let project_root = env::current_dir()?;
+    let operation_id = objection_operation_id(label);
+    let backup_root = project_root
+        .join("he1_respaldo")
+        .join("objeciones")
+        .join(&operation_id);
+    fs::create_dir_all(&backup_root)?;
+    let pre_merge_report_path = backup_root.join("pre_merge.csv");
+    write_objection_preview_csv(&report, &pre_merge_report_path)?;
+    let pre_merge_report_sha256 = sha256_file(&pre_merge_report_path)?;
+
+    let mut mutations: Vec<ObjectionFileMutation> = Vec::with_capacity(plans.len());
+    let mut temporary_files = ObjectionTempCleanup::default();
+    let mut journal = ObjectionJournal {
+        operation_id: operation_id.clone(),
+        label: label.to_string(),
+        plan_fingerprint: fingerprint.clone(),
+        pre_merge_report: pre_merge_report_path.display().to_string(),
+        pre_merge_report_sha256,
+        state: "preparing".to_string(),
+        groups: Vec::with_capacity(plans.len()),
+    };
+    let journal_path = backup_root.join("manifest.json");
+
+    for (index, plan) in plans.iter().enumerate() {
+        let group_backup = backup_root.join(format!("grupo_{:04}", index + 1));
+        fs::create_dir_all(&group_backup)?;
+        let mut staged_inputs = Vec::with_capacity(plan.input_paths.len());
+        for (source_index, source) in plan.input_paths.iter().enumerate() {
+            let backup = group_backup.join(format!("origen_{:03}.pdf", source_index + 1));
+            fs::copy(source, &backup)?;
+            let expected = plan
+                .source_snapshots
+                .iter()
+                .find(|snapshot| snapshot.path == source.display().to_string())
+                .ok_or_else(|| format!("no hay huella previa para {}", source.display()))?;
+            if sha256_file(&backup)? != expected.sha256 {
+                return Err(format!(
+                    "el archivo cambió después de la vista previa: {}. No se aplicó el plan.",
+                    source.display()
+                )
+                .into());
+            }
+            staged_inputs.push(backup);
+        }
+        let previous_output_backup = if plan.output_path.exists() {
+            let backup = group_backup.join("salida_anterior.pdf");
+            fs::copy(&plan.output_path, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+        let temporary_path = plan
+            .folder
+            .join(format!(".{}.{}.tmp.pdf", plan.base, operation_id));
+        if temporary_path.exists() {
+            return Err(format!(
+                "ya existe un temporal de objeción: {}",
+                temporary_path.display()
+            )
+            .into());
+        }
+        temporary_files.track(temporary_path.clone());
+        if let Err(err) = merge_pdfs(&staged_inputs, &temporary_path) {
+            for mutation in &mutations {
+                let _ = fs::remove_file(&mutation.temporary_path);
+            }
+            let _ = fs::remove_file(&temporary_path);
+            return Err(
+                format!("no se pudo unir {} en {}: {}", plan.base, plan.tramite, err).into(),
+            );
+        }
+        let merged_pages = page_count(&temporary_path)?;
+        let merged_size = fs::metadata(&temporary_path)?.len();
+        let merged_sha256 = sha256_file(&temporary_path)?;
+        if merged_pages != plan.total_pages || merged_size == 0 {
+            let _ = fs::remove_file(&temporary_path);
+            for mutation in &mutations {
+                let _ = fs::remove_file(&mutation.temporary_path);
+            }
+            return Err(format!(
+                "validación fallida para trámite {} base {}: esperadas {} páginas, salida {} páginas, {} bytes",
+                plan.tramite, plan.base, plan.total_pages, merged_pages, merged_size
+            )
+            .into());
+        }
+        mutations.push(ObjectionFileMutation {
+            output_path: plan.output_path.clone(),
+            temporary_path: temporary_path.clone(),
+            previous_output_backup: previous_output_backup.clone(),
+            cleanup_paths: plan.cleanup_paths.clone(),
+        });
+        journal.groups.push(ObjectionJournalGroup {
+            tramite: plan.tramite.clone(),
+            base: plan.base.clone(),
+            output_path: plan.output_path.display().to_string(),
+            temporary_path: temporary_path.display().to_string(),
+            part_paths: plan
+                .part_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            unrequested_part_paths: plan
+                .unrequested_part_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            cleanup_paths: plan
+                .cleanup_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            input_paths: plan
+                .input_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            source_snapshots: plan.source_snapshots.clone(),
+            unrequested_snapshots: plan.unrequested_snapshots.clone(),
+            previous_output_backup: previous_output_backup.map(|p| p.display().to_string()),
+            total_pages: plan.total_pages,
+            output_size_bytes: merged_size,
+            output_sha256: merged_sha256,
+        });
+    }
+
+    if let Err(err) = write_json_atomic(&journal_path, &journal) {
+        for mutation in &mutations {
+            let _ = fs::remove_file(&mutation.temporary_path);
+        }
+        return Err(err);
+    }
+    let mut published = 0usize;
+    for mutation in &mutations {
+        if let Err(err) = fs::rename(&mutation.temporary_path, &mutation.output_path) {
+            let rollback = rollback_objection_outputs(&mutations[..published]);
+            journal.state = if rollback.is_ok() {
+                "rolled_back"
+            } else {
+                "recovery_required"
+            }
+            .to_string();
+            let _ = write_json_atomic(&journal_path, &journal);
+            for pending in &mutations[published..] {
+                let _ = fs::remove_file(&pending.temporary_path);
+            }
+            return Err(format!(
+                "no se pudo publicar la salida; rollback={:?}: {}",
+                rollback.err(),
+                err
+            )
+            .into());
+        }
+        published += 1;
+    }
+    journal.state = "files_published".to_string();
+    if let Err(err) = write_json_atomic(&journal_path, &journal) {
+        let rollback = rollback_objection_outputs(&mutations);
+        journal.state = if rollback.is_ok() {
+            "rolled_back"
+        } else {
+            "recovery_required"
+        }
+        .to_string();
+        let _ = write_json_atomic(&journal_path, &journal);
+        return Err(format!(
+            "no se pudo guardar el estado del manifiesto; rollback={:?}: {}",
+            rollback.err(),
+            err
+        )
+        .into());
+    }
+
+    let changes = plans
+        .iter()
+        .flat_map(|plan| plan.db_groups.iter().cloned())
+        .collect::<Vec<_>>();
+    let apply = ObjectionDbApplyRequest {
+        label: label.to_string(),
+        groups: changes,
+    };
+    let response = match run_objection_db_apply(&helper, label, &apply) {
+        Ok(response) => response,
+        Err(err) => {
+            let rollback = rollback_objection_outputs(&mutations);
+            journal.state = if rollback.is_ok() {
+                "rolled_back"
+            } else {
+                "recovery_required"
+            }
+            .to_string();
+            let _ = write_json_atomic(&journal_path, &journal);
+            return Err(format!(
+                "Oracle no confirmó la actualización; rollback={:?}: {}",
+                rollback.err(),
+                err
+            )
+            .into());
+        }
+    };
+    if response.status == "commit_uncertain" {
+        journal.state = "oracle_commit_uncertain".to_string();
+        write_json_atomic(&journal_path, &journal)?;
+        return Err(format!(
+            "Oracle no confirmó el resultado del commit. Se conservaron los fragmentos y la salida; revisar antes de reintentar. {}",
+            response.message.unwrap_or_default()
+        )
+        .into());
+    }
+    if response.status != "committed" {
+        let rollback = rollback_objection_outputs(&mutations);
+        journal.state = if rollback.is_ok() {
+            "rolled_back"
+        } else {
+            "recovery_required"
+        }
+        .to_string();
+        let _ = write_json_atomic(&journal_path, &journal);
+        return Err(format!(
+            "respuesta Oracle inesperada {:?}; rollback={:?}",
+            response.status,
+            rollback.err()
+        )
+        .into());
+    }
+
+    journal.state = "oracle_committed".to_string();
+    if let Err(err) = write_json_atomic(&journal_path, &journal) {
+        eprintln!(
+            "advertencia: Oracle confirmó cambios, pero no se actualizó el manifiesto: {}",
+            err
+        );
+    }
+
+    let mut cleanup_errors = Vec::new();
+    for mutation in &mutations {
+        for source in &mutation.cleanup_paths {
+            let expected_hash = plans
+                .iter()
+                .flat_map(|plan| plan.source_snapshots.iter())
+                .find(|snapshot| snapshot.path == source.display().to_string())
+                .map(|snapshot| snapshot.sha256.as_str());
+            match (expected_hash, sha256_file(source)) {
+                (Some(expected), Ok(actual)) if actual == expected => {
+                    if let Err(err) = fs::remove_file(source) {
+                        cleanup_errors.push(format!("{}: {}", source.display(), err));
+                    }
+                }
+                (Some(_), Ok(_)) => cleanup_errors.push(format!(
+                    "{} cambió después de la consolidación; se dejó intacto",
+                    source.display()
+                )),
+                (_, Err(err)) => cleanup_errors.push(format!("{}: {}", source.display(), err)),
+                (None, _) => cleanup_errors.push(format!(
+                    "{} no tiene huella previa; se dejó intacto",
+                    source.display()
+                )),
+            }
+        }
+    }
+
+    let mut pending = Vec::new();
+    let mut refreshed = HashSet::new();
+    for plan in &plans {
+        if !refreshed.insert(plan.tramite.clone()) {
+            continue;
+        }
+        match refresh_objection_cache(&refresh_client, &refresh_template, &plan.tramite) {
+            Ok(()) => {
+                if let Err(err) = remove_pending_refresh(&project_root, label, &plan.tramite) {
+                    eprintln!(
+                        "advertencia: la caché se actualizó, pero no se pudo limpiar la cola local: {}",
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "advertencia: no se pudo refrescar la caché del trámite {}: {}",
+                    plan.tramite, err
+                );
+                pending.push(PendingObjectionRefresh {
+                    label: label.to_string(),
+                    tramite: plan.tramite.clone(),
+                });
+            }
+        }
+    }
+    let mut pending_queue_error = None;
+    if !pending.is_empty() {
+        if let Err(err) = append_pending_refreshes(&project_root, &pending) {
+            pending_queue_error = Some(err.to_string());
+        }
+    }
+
+    journal.state = if !cleanup_errors.is_empty() {
+        "cleanup_pending".to_string()
+    } else if !pending.is_empty() {
+        if pending_queue_error.is_some() {
+            "refresh_pending_not_recorded".to_string()
+        } else {
+            "refresh_pending".to_string()
+        }
+    } else {
+        "completed".to_string()
+    };
+    write_json_atomic(&journal_path, &journal)?;
+
+    let summary = format!(
+        "Objeción {} completada: {} grupo(s) unidos, {} fila(s) eliminadas, {} descarga(s) actualizadas. Estado: {}. Respaldo: {}.",
+        label,
+        response.groups_updated,
+        response.items_deleted,
+        response.downloads_updated,
+        journal.state,
+        backup_root.display()
+    );
+    println!("{}", summary);
+    println!("Respaldo y manifiesto: {}", backup_root.display());
+    if !cleanup_errors.is_empty() {
+        eprintln!(
+            "No se pudieron borrar algunos fragmentos; el PDF canónico y Oracle ya quedaron actualizados:\n  {}",
+            cleanup_errors.join("\n  ")
+        );
+    }
+    if !pending.is_empty() {
+        eprintln!(
+            "Quedó pendiente refrescar la caché. Reintenta con: --modo objeciones --reintentar-refresh"
+        );
+    }
+    if let Some(err) = pending_queue_error {
+        eprintln!(
+            "No se pudo guardar la cola local de refresco; conserva el trámite y vuelve a ejecutar el refresco: {}",
+            err
+        );
+    }
+    Ok(ObjectionRunOutcome::Applied(ObjectionApplyOutcome {
+        summary,
+        manifest_path: journal_path,
+        report_path: pre_merge_report_path,
+    }))
+}
+
+fn objection_db_helper_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(path) = env::var("HE1_OBJECTION_DB_HELPER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "HE1_OBJECTION_DB_HELPER no apunta a un ejecutable: {}",
+            path.display()
+        )
+        .into());
+    }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let sibling = parent.join("he1-objeciones-db");
+            if sibling.is_file() {
+                return Ok(sibling);
+            }
+        }
+    }
+    let source_tree =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("go_aplicacion/bin/he1-objeciones-db");
+    if source_tree.is_file() {
+        return Ok(source_tree);
+    }
+    Err(format!(
+        "no se encontró el auxiliar Oracle {}; compílalo con: cd go_aplicacion && go build -o bin/he1-objeciones-db ./cmd/objeciones",
+        source_tree.display()
+    )
+    .into())
+}
+
+fn run_objection_db_plan(
+    helper: &Path,
+    label: &str,
+) -> Result<ObjectionDbPlan, Box<dyn std::error::Error>> {
+    let output = Command::new(helper)
+        .args(["--action", "plan", "--label", label])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "falló la consulta Oracle: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_objection_db_apply(
+    helper: &Path,
+    label: &str,
+    request: &ObjectionDbApplyRequest,
+) -> Result<ObjectionDbApplyResponse, Box<dyn std::error::Error>> {
+    let mut child = Command::new(helper)
+        .args(["--action", "apply", "--label", label])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    serde_json::to_writer(
+        child
+            .stdin
+            .as_mut()
+            .ok_or("no se abrió stdin del auxiliar Oracle")?,
+        request,
+    )?;
+    drop(child.stdin.take());
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Oracle rechazó la transacción: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn objection_data_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let configured = env::var("HE1_OBJECTION_DATA_ROOT")
+        .unwrap_or_else(|_| "/data_nuevo/repo_grande/data/datos".to_string());
+    let root = fs::canonicalize(&configured)
+        .map_err(|err| format!("no existe HE1_OBJECTION_DATA_ROOT {}: {}", configured, err))?;
+    if !root.is_dir() {
+        return Err(format!("HE1_OBJECTION_DATA_ROOT no es carpeta: {}", root.display()).into());
+    }
+    Ok(root)
+}
+
+fn build_objection_merge_plans(
+    db_plan: &ObjectionDbPlan,
+    allowed_root: &Path,
+) -> Result<Vec<ObjectionMergePlan>, Box<dyn std::error::Error>> {
+    let mut groups: BTreeMap<(String, String), BTreeMap<String, BTreeSet<String>>> =
+        BTreeMap::new();
+    let mut candidate_paths: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for item in &db_plan.items {
+        let name = Path::new(&item.nombre_pdf)
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "nombre PDF inválido en Oracle para trámite {}",
+                    item.tramite
+                )
+            })?;
+        if name != item.nombre_pdf {
+            return Err(format!(
+                "Oracle devolvió una ruta en lugar de nombre PDF: {}",
+                item.nombre_pdf
+            )
+            .into());
+        }
+        let Some((base, is_part)) = classify_objection_pdf(name) else {
+            continue;
+        };
+        if !is_part {
+            continue;
+        }
+        let mut item_paths = item.folder_paths.clone();
+        if let Some(path) = &item.folder_path {
+            item_paths.push(path.clone());
+        }
+        if item_paths.is_empty() {
+            return Err(
+                format!("SQLite no devolvió carpetas para trámite {}", item.tramite).into(),
+            );
+        }
+        let key = (item.tramite.clone(), base);
+        groups
+            .entry(key.clone())
+            .or_default()
+            .entry(item.id_descarga.clone())
+            .or_default()
+            .insert(name.to_ascii_uppercase());
+        candidate_paths.entry(key).or_default().extend(item_paths);
+    }
+
+    let mut plans = Vec::new();
+    for ((tramite, base), by_download) in groups {
+        let Some(expected_parts) = by_download.values().next().cloned() else {
+            continue;
+        };
+        if expected_parts.len() < 2 {
+            continue;
+        }
+        for (id_descarga, names) in &by_download {
+            if names.len() < 2 || names != &expected_parts {
+                return Err(format!(
+                    "los archivos fraccionados de {} en la descarga {} no están completos o no coinciden",
+                    base, id_descarga
+                )
+                .into());
+            }
+        }
+
+        let mut matching_folders = Vec::new();
+        let mut folder_diagnostics = Vec::new();
+        let raw_candidates = candidate_paths
+            .get(&(tramite.clone(), base.clone()))
+            .ok_or_else(|| format!("no hay carpetas candidatas para trámite {}", tramite))?;
+        let mut canonical_candidates = BTreeSet::new();
+        for raw_path in raw_candidates {
+            let folder = fs::canonicalize(raw_path).map_err(|err| {
+                format!(
+                    "ruta inválida para trámite {} ({}): {}",
+                    tramite, raw_path, err
+                )
+            })?;
+            if !folder.starts_with(allowed_root) {
+                return Err(format!(
+                    "ruta fuera de HE1_OBJECTION_DATA_ROOT para trámite {}: {}",
+                    tramite,
+                    folder.display()
+                )
+                .into());
+            }
+            if !folder.is_dir() {
+                continue;
+            }
+            canonical_candidates.insert(folder);
+        }
+        for folder in canonical_candidates {
+            let mut disk_parts: BTreeMap<String, PathBuf> = BTreeMap::new();
+            for entry in fs::read_dir(&folder).map_err(|err| {
+                format!(
+                    "no se pudo leer carpeta candidata {}: {}",
+                    folder.display(),
+                    err
+                )
+            })? {
+                let path = entry?.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if let Some((file_base, true)) = classify_objection_pdf(&name) {
+                    if file_base == base {
+                        let key = name.to_ascii_uppercase();
+                        if disk_parts.insert(key.clone(), path).is_some() {
+                            return Err(format!(
+                                "hay nombres de PDF duplicados ignorando mayúsculas en trámite {}: {}",
+                                tramite, name
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            let disk_names = disk_parts.keys().cloned().collect::<BTreeSet<_>>();
+            if expected_parts.is_subset(&disk_names) {
+                matching_folders.push((folder, disk_parts));
+            } else {
+                folder_diagnostics.push(format!("{} => {:?}", folder.display(), disk_names));
+            }
+        }
+        if matching_folders.len() != 1 {
+            let detail = if matching_folders.is_empty() {
+                format!(
+                    "ninguna carpeta contiene todas las partes de Oracle; Oracle={:?}; disco=[{}]",
+                    expected_parts,
+                    folder_diagnostics.join("; ")
+                )
+            } else {
+                "más de una carpeta coincide con los fragmentos de Oracle".to_string()
+            };
+            return Err(format!(
+                "no se puede elegir una carpeta única para trámite {} y {}: {}",
+                tramite, base, detail
+            )
+            .into());
+        }
+        let (folder, disk_parts) = matching_folders.pop().expect("se validó una única carpeta");
+        let output_path = folder.join(format!("{}.pdf", base));
+        let mut part_paths = expected_parts
+            .iter()
+            .filter_map(|name| disk_parts.get(name).cloned())
+            .collect::<Vec<_>>();
+        part_paths.sort_by(|a, b| compare_objection_parts(a, b, &base));
+        let mut unrequested_part_paths = disk_parts
+            .iter()
+            .filter(|(name, _)| !expected_parts.contains(*name))
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        unrequested_part_paths.sort_by(|a, b| compare_objection_parts(a, b, &base));
+        let mut cleanup_paths = part_paths.clone();
+        let mut input_paths = part_paths.clone();
+        for entry in fs::read_dir(&folder)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if matches!(classify_objection_pdf(name), Some((ref file_base, false)) if file_base == &base)
+            {
+                input_paths.push(path.clone());
+                if path != output_path {
+                    cleanup_paths.push(path);
+                }
+            }
+        }
+        input_paths.sort_by(|a, b| compare_objection_parts(a, b, &base));
+        cleanup_paths.sort_by(|a, b| compare_objection_parts(a, b, &base));
+        let mut total_pages = 0u32;
+        let mut source_snapshots = Vec::with_capacity(input_paths.len());
+        for path in &input_paths {
+            let resolved = fs::canonicalize(path).map_err(|err| {
+                format!(
+                    "no se pudo resolver el PDF de origen {}: {}",
+                    path.display(),
+                    err
+                )
+            })?;
+            if !resolved.starts_with(allowed_root) {
+                return Err(format!(
+                    "el PDF de origen escapa de HE1_OBJECTION_DATA_ROOT: {}",
+                    path.display()
+                )
+                .into());
+            }
+            let pages = page_count(path)?;
+            total_pages = total_pages
+                .checked_add(pages)
+                .ok_or("demasiadas páginas en el grupo")?;
+            source_snapshots.push(snapshot_objection_source(path, pages)?);
+        }
+        let mut unrequested_snapshots = Vec::with_capacity(unrequested_part_paths.len());
+        for path in &unrequested_part_paths {
+            unrequested_snapshots.push(snapshot_objection_source(path, page_count(path)?)?);
+        }
+
+        let mut db_groups = Vec::new();
+        for (id_descarga, names) in by_download {
+            let mut part_names = names.into_iter().collect::<Vec<_>>();
+            part_names.sort_by(|a, b| compare_objection_names(a, b, &base));
+            db_groups.push(ObjectionDbChange {
+                id_descarga,
+                tramite: tramite.clone(),
+                base: base.clone(),
+                canonical_name: format!("{}.pdf", base),
+                part_names,
+                output_path: output_path.display().to_string(),
+                total_pages,
+            });
+        }
+        plans.push(ObjectionMergePlan {
+            tramite,
+            folder,
+            base,
+            part_paths,
+            unrequested_part_paths,
+            cleanup_paths,
+            input_paths,
+            source_snapshots,
+            unrequested_snapshots,
+            output_path,
+            total_pages,
+            db_groups,
+        });
+    }
+    Ok(plans)
+}
+
+fn snapshot_objection_source(
+    path: &Path,
+    pages: u32,
+) -> Result<ObjectionSourceSnapshot, Box<dyn std::error::Error>> {
+    let metadata = fs::metadata(path)?;
+    let modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    Ok(ObjectionSourceSnapshot {
+        filename: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("desconocido")
+            .to_string(),
+        path: path.display().to_string(),
+        size_bytes: metadata.len(),
+        pages,
+        modified_unix_seconds,
+        sha256: sha256_file(path)?,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn build_objection_execution_plan(
+    label: &str,
+) -> Result<ObjectionExecutionPlan, Box<dyn std::error::Error>> {
+    let helper = objection_db_helper_path()?;
+    let db_plan = run_objection_db_plan(&helper, label)?;
+    if db_plan.label != label {
+        return Err("la etiqueta devuelta por el auxiliar Oracle no coincide".into());
+    }
+    let data_root = objection_data_root()?;
+    let plans = build_objection_merge_plans(&db_plan, &data_root)?;
+    let report = ObjectionPreviewReport {
+        label: label.to_string(),
+        groups: plans
+            .iter()
+            .map(|plan| ObjectionPreviewGroup {
+                tramite: plan.tramite.clone(),
+                document: plan.base.clone(),
+                destination: plan.output_path.display().to_string(),
+                total_pages: plan.total_pages,
+                oracle_items: plan
+                    .db_groups
+                    .iter()
+                    .map(|group| ObjectionPreviewOracleItem {
+                        id_descarga: group.id_descarga.clone(),
+                        source_names: group.part_names.clone(),
+                    })
+                    .collect(),
+                source_files: plan.source_snapshots.clone(),
+                unrequested_files: plan.unrequested_snapshots.clone(),
+            })
+            .collect(),
+    };
+    let fingerprint = sha256_bytes(&serde_json::to_vec(&report)?);
+    Ok(ObjectionExecutionPlan {
+        helper,
+        plans,
+        report,
+        fingerprint,
+    })
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(crate) fn prepare_telegram_objection_preview(
+    label: &str,
+) -> Result<TelegramObjectionPreview, Box<dyn std::error::Error>> {
+    let execution = build_objection_execution_plan(label)?;
+    if execution.plans.is_empty() {
+        return Err(format!("la etiqueta {} no tiene grupos fraccionados", label).into());
+    }
+    write_telegram_objection_preview(label, &execution.report, &execution.fingerprint)
+}
+
+fn write_telegram_objection_preview(
+    label: &str,
+    report: &ObjectionPreviewReport,
+    fingerprint: &str,
+) -> Result<TelegramObjectionPreview, Box<dyn std::error::Error>> {
+    let preview_root = env::current_dir()?
+        .join("he1_respaldo")
+        .join("objeciones")
+        .join("vistas_previas");
+    fs::create_dir_all(&preview_root)?;
+    let report_path = preview_root.join(format!(
+        "{}_antes_{}.csv",
+        objection_operation_id(label),
+        &fingerprint[..12.min(fingerprint.len())]
+    ));
+    write_objection_preview_csv(report, &report_path)?;
+    Ok(TelegramObjectionPreview {
+        label: label.to_string(),
+        fingerprint: fingerprint.to_string(),
+        report_path,
+        groups: report.groups.len(),
+        pages: report
+            .groups
+            .iter()
+            .map(|group| u64::from(group.total_pages))
+            .sum(),
+    })
+}
+
+fn write_objection_preview_csv(
+    report: &ObjectionPreviewReport,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut contents = String::from(
+        "estado,etiqueta,trámite,documento,archivo_origen,ruta_origen,tamaño_bytes,páginas,modificado_unix,sha256,destino,páginas_destino_plan,ítems_oracle\n",
+    );
+    for group in &report.groups {
+        let oracle_items = group
+            .oracle_items
+            .iter()
+            .map(|item| format!("{}:{}", item.id_descarga, item.source_names.join("|")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        for (state, sources) in [
+            ("se_uniria", &group.source_files),
+            ("fuera_de_etiqueta_se_conserva", &group.unrequested_files),
+        ] {
+            for source in sources {
+                let fields = [
+                    state.to_string(),
+                    report.label.clone(),
+                    group.tramite.clone(),
+                    group.document.clone(),
+                    source.filename.clone(),
+                    source.path.clone(),
+                    source.size_bytes.to_string(),
+                    source.pages.to_string(),
+                    source
+                        .modified_unix_seconds
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    source.sha256.clone(),
+                    group.destination.clone(),
+                    group.total_pages.to_string(),
+                    oracle_items.clone(),
+                ];
+                contents.push_str(
+                    &fields
+                        .iter()
+                        .map(|field| csv_escape(field))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                contents.push('\n');
+            }
+        }
+    }
+    let parent = path.parent().ok_or("ruta de reporte previa inválida")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("csv.tmp");
+    fs::write(&temporary, contents.as_bytes())?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn csv_escape(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+pub(crate) fn confirm_telegram_objection_plan(
+    label: &str,
+    expected_fingerprint: &str,
+) -> Result<TelegramObjectionApply, Box<dyn std::error::Error>> {
+    match run_objection_mode_checked(label, false, Some(expected_fingerprint))? {
+        ObjectionRunOutcome::Applied(result) => Ok(TelegramObjectionApply::Applied {
+            summary: result.summary,
+            manifest_path: result.manifest_path,
+            report_path: result.report_path,
+        }),
+        ObjectionRunOutcome::PlanChanged(preview) => {
+            Ok(TelegramObjectionApply::PlanChanged(preview))
+        }
+        ObjectionRunOutcome::NoGroups => {
+            Err(format!("ya no hay grupos fraccionados para la etiqueta {}", label).into())
+        }
+        ObjectionRunOutcome::DryRun => Err("estado inesperado al confirmar objeciones".into()),
+    }
+}
+
+fn classify_objection_pdf(name: &str) -> Option<(String, bool)> {
+    let path = Path::new(name);
+    if !path.extension()?.to_str()?.eq_ignore_ascii_case("pdf") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let normalized = normalize_stem(stem).to_ascii_uppercase();
+    if normalized == "RDH" {
+        return Some(("RHD".to_string(), !stem.eq_ignore_ascii_case("RDH")));
+    }
+    if let Some(suffix) = normalized.strip_prefix("RDH") {
+        if is_allowed_variant_suffix(suffix) {
+            return Some(("RHD".to_string(), true));
+        }
+    }
+    let base = detect_group_base(stem)?;
+    if normalized == base.to_ascii_uppercase() {
+        return Some((base.to_string(), !stem.eq_ignore_ascii_case(base)));
+    }
+    let suffix = normalized.strip_prefix(&base.to_ascii_uppercase())?;
+    if is_allowed_variant_suffix(suffix) {
+        Some((base.to_string(), true))
+    } else {
+        None
+    }
+}
+
+fn compare_objection_parts(a: &Path, b: &Path, base: &str) -> std::cmp::Ordering {
+    objection_sort_key(a.file_name().and_then(|v| v.to_str()).unwrap_or(""), base).cmp(
+        &objection_sort_key(b.file_name().and_then(|v| v.to_str()).unwrap_or(""), base),
+    )
+}
+
+fn compare_objection_names(a: &str, b: &str, base: &str) -> std::cmp::Ordering {
+    objection_sort_key(a, base).cmp(&objection_sort_key(b, base))
+}
+
+fn objection_sort_key(name: &str, base: &str) -> (u8, u8, u64, String) {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or(name);
+    let mut normalized = normalize_stem(stem).to_ascii_uppercase();
+    let base_upper = base.to_ascii_uppercase();
+    if base_upper == "RHD" {
+        if let Some(suffix) = normalized.strip_prefix("RDH") {
+            normalized = format!("RHD{}", suffix);
+        }
+    }
+    if normalized == base_upper {
+        return (0, 0, 0, normalized);
+    }
+    let suffix = normalized.strip_prefix(&base_upper).unwrap_or("");
+    let suffix = suffix.trim_start_matches(|c| c == '_' || c == '-');
+    if let Ok(number) = suffix.parse::<u64>() {
+        (1, 0, number, normalized)
+    } else {
+        (1, 1, u64::MAX, normalized)
+    }
+}
+
+fn objection_refresh_template() -> Result<String, Box<dyn std::error::Error>> {
+    let template = env::var("HE1_OBJECTION_REFRESH_URL_TEMPLATE")
+        .unwrap_or_else(|_| "http://127.0.0.1:8091/api/cache/tramite/{tramite}".to_string());
+    if !(template.starts_with("http://") || template.starts_with("https://"))
+        || !template.contains("{tramite}")
+    {
+        return Err(
+            "HE1_OBJECTION_REFRESH_URL_TEMPLATE debe ser una URL HTTP(S) e incluir {tramite}"
+                .into(),
+        );
+    }
+    Ok(template)
+}
+
+fn refresh_objection_cache(
+    client: &reqwest::blocking::Client,
+    template: &str,
+    tramite: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = template.replace("{tramite}", &encode_url_segment(tramite));
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match client
+            .post(&url)
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    match last_error {
+        Some(err) => Err(err.into()),
+        None => Err("falló la actualización de caché".into()),
+    }
+}
+
+fn encode_url_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    out
+}
+
+fn pending_refresh_path(root: &Path) -> PathBuf {
+    root.join("he1_respaldo")
+        .join("objeciones")
+        .join("pending_refresh.json")
+}
+
+fn append_pending_refreshes(
+    root: &Path,
+    additions: &[PendingObjectionRefresh],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = pending_refresh_path(root);
+    let mut pending = if path.exists() {
+        serde_json::from_slice::<Vec<PendingObjectionRefresh>>(&fs::read(&path)?)?
+    } else {
+        Vec::new()
+    };
+    for item in additions {
+        if !pending
+            .iter()
+            .any(|old| old.label == item.label && old.tramite == item.tramite)
+        {
+            pending.push(item.clone());
+        }
+    }
+    write_json_atomic(&path, &pending)
+}
+
+fn remove_pending_refresh(
+    root: &Path,
+    label: &str,
+    tramite: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = pending_refresh_path(root);
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut pending = serde_json::from_slice::<Vec<PendingObjectionRefresh>>(&fs::read(&path)?)?;
+    pending.retain(|item| item.label != label || item.tramite != tramite);
+    if pending.is_empty() {
+        fs::remove_file(path)?;
+    } else {
+        write_json_atomic(&path, &pending)?;
+    }
+    Ok(())
+}
+
+fn retry_pending_objection_refreshes() -> Result<(), Box<dyn std::error::Error>> {
+    let template = objection_refresh_template()?;
+    let root = env::current_dir()?;
+    let path = pending_refresh_path(&root);
+    if !path.exists() {
+        println!("No hay refrescos de caché pendientes.");
+        return Ok(());
+    }
+    let pending = serde_json::from_slice::<Vec<PendingObjectionRefresh>>(&fs::read(&path)?)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut remaining = Vec::new();
+    for item in &pending {
+        match refresh_objection_cache(&client, &template, &item.tramite) {
+            Ok(()) => println!(
+                "Caché actualizada para trámite {} (objeción {}).",
+                item.tramite, item.label
+            ),
+            Err(err) => {
+                eprintln!("Sigue pendiente el trámite {}: {}", item.tramite, err);
+                remaining.push(item.clone());
+            }
+        }
+    }
+    if remaining.is_empty() {
+        fs::remove_file(path)?;
+    } else {
+        write_json_atomic(&path, &remaining)?;
+    }
+    Ok(())
+}
+
+fn objection_operation_id(label: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}_{}_{}", label, nanos, std::process::id())
+}
+
+fn rollback_objection_outputs(
+    mutations: &[ObjectionFileMutation],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errors = Vec::new();
+    for mutation in mutations.iter().rev() {
+        if let Some(backup) = &mutation.previous_output_backup {
+            let restore_tmp = mutation.output_path.with_extension("restore.tmp.pdf");
+            if let Err(err) = fs::copy(backup, &restore_tmp)
+                .and_then(|_| fs::rename(&restore_tmp, &mutation.output_path))
+            {
+                errors.push(format!("{}: {}", mutation.output_path.display(), err));
+            }
+        } else if mutation.output_path.exists() {
+            if let Err(err) = fs::remove_file(&mutation.output_path) {
+                errors.push(format!("{}: {}", mutation.output_path.display(), err));
+            }
+        }
+        let _ = fs::remove_file(&mutation.temporary_path);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
+}
+
+fn write_json_atomic(
+    path: &Path,
+    value: &impl Serialize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path.parent().ok_or("ruta de manifiesto inválida")?;
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(&temp, bytes)?;
+    fs::rename(temp, path)?;
+    Ok(())
 }
 
 fn run_directory_list(
@@ -846,6 +2260,8 @@ fn print_usage() {
     println!("  he1-unificar-pdfs --report <etiqueta | ruta_manifest_o_respaldo>");
     println!("  he1-unificar-pdfs --check <etiqueta | ruta_manifest_o_respaldo> <carpeta>");
     println!("  he1-unificar-pdfs --convert-paths <entrada.txt> <salida.txt>");
+    println!("  he1-unificar-pdfs --modo objeciones --label <etiqueta> [--dry-run]");
+    println!("  he1-unificar-pdfs --modo objeciones --reintentar-refresh");
     println!("  he1-unificar-pdfs --telegram");
     println!();
     println!("ejemplo:");

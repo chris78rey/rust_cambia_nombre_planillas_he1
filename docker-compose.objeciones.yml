@@ -1,0 +1,6 @@
+services:
+  he1:
+    volumes:
+      - type: bind
+        source: ${HE1_DATA_HOST_ROOT:?Define HE1_DATA_HOST_ROOT en .env}
+        target: /data_nuevo/repo_grande/data

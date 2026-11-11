@@ -26,6 +26,16 @@ case "${HE1_MODE:-process}" in
   telegram)
     exec he1-unificar-pdfs --telegram
     ;;
+  objeciones|objections)
+    label="${HE1_OBJECTION_LABEL:?HE1_OBJECTION_LABEL requerido}"
+    if [ "${HE1_DRY_RUN:-true}" = "true" ]; then
+      exec he1-unificar-pdfs --modo objeciones --label "$label" --dry-run
+    fi
+    exec he1-unificar-pdfs --modo objeciones --label "$label"
+    ;;
+  retry_objection_refresh|reintentar_refresh)
+    exec he1-unificar-pdfs --modo objeciones --reintentar-refresh
+    ;;
   *)
     echo "HE1_MODE invalido: ${HE1_MODE:-}" >&2
     exit 2

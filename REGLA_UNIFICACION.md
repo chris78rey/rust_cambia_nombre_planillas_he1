@@ -168,3 +168,55 @@ Cuando el grupo se consolida:
 - se valida que el PDF final no quede vacio;
 - solo si pasa la validacion se eliminan los fuentes del grupo;
 - si falla la corrida, se usa el respaldo de esa ejecucion para restaurar.
+
+## Modo de objeciones
+
+Este modo procesa únicamente los PDFs fraccionados que aparecen en los ítems Oracle de la etiqueta indicada. Resuelve las carpetas mediante `folders.sqlite`, usa los códigos de `VALID_NAMES` y comprueba que los fragmentos del disco coincidan con los nombres solicitados en Oracle.
+
+Antes de aplicarlo, compila el auxiliar Oracle:
+
+```bash
+cd go_aplicacion
+go build -o bin/he1-objeciones-db ./cmd/objeciones
+cd ..
+cargo build --release
+```
+
+Primero simula el plan:
+
+```bash
+./target/release/rust_cambia_nombre_planillas_he1 --modo objeciones --label 162158 --dry-run
+```
+
+La simulación consulta Oracle y SQLite, muestra los grupos y páginas, y no modifica archivos ni bases de datos. Para aplicar el plan, quita `--dry-run`.
+
+Configuración requerida para aplicar:
+
+- `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_SCHEMA`, `ORACLE_ENDPOINTS` y, si corresponde, `ORACLE_PORT`.
+- `HE1_OBJECTION_ORACLE_PORT` (por defecto `1521`, igual que los otros auxiliares Oracle del repo; cámbialo solo si el listener Oracle usa otro puerto).
+- `SQLITE_DSN` y las variables de tabla/columnas de `folders.sqlite` ya usadas por el auxiliar Go.
+- `HE1_OBJECTION_DATA_ROOT`, raíz permitida para las carpetas de trámites.
+- `HE1_OBJECTION_REFRESH_URL_TEMPLATE`, URL HTTP(S) del servicio de caché que incluya `{tramite}`. Por defecto usa `http://127.0.0.1:8091/api/cache/tramite/{tramite}`; configúrala para Docker u otro host.
+- `HE1_OBJECTION_AUDIT_SQLITE`, opcional; por defecto escribe `uploads_audit.sqlite`.
+
+El programa crea una salida temporal, verifica páginas y tamaño, guarda respaldos, publica el PDF canónico y actualiza en una transacción los ítems y `TOTAL_PDFS` para las descargas afectadas. Después elimina los fragmentos y solicita el refresco de caché. La tabla maestra `DIGITALIZACION` no se modifica.
+
+Si el refresco HTTP falla después del commit, se guarda una cola local. Reinténtala cuando el servicio esté disponible:
+
+```bash
+./target/release/rust_cambia_nombre_planillas_he1 --modo objeciones --reintentar-refresh
+```
+
+### Telegram con revisión previa
+
+Desde el chat autorizado, envía `/objeciones <etiqueta>` (por ejemplo, `/objeciones 162158`). El bot adjunta un CSV de estado previo con cada PDF seleccionado, ruta, tamaño, páginas, fecha de modificación y SHA-256. El operador debe revisar ese archivo y escribir `APLICAR`; `Salir` cancela.
+
+Al confirmar, el bot vuelve a consultar Oracle y a calcular las huellas. Si cambió algún archivo o fila, no aplica el plan anterior: adjunta una vista previa nueva y pide confirmarla de nuevo. Después de aplicar, envía otra vez el CSV previo y el manifiesto JSON con las huellas de origen y del PDF generado. Las evidencias quedan bajo `he1_respaldo/objeciones/`.
+
+En Docker, usa `HE1_MODE=objeciones`, `HE1_OBJECTION_LABEL=<etiqueta>` y `HE1_DRY_RUN=true` para simular. Cambia `HE1_DRY_RUN=false` para aplicar. Monta la base SQLite y las carpetas de trámites con el override incluido:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.objeciones.yml run --rm he1
+```
+
+`HE1_DATA_HOST_ROOT` debe apuntar en el host a la carpeta que contiene `folders.sqlite` y `datos/`.

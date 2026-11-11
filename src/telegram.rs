@@ -77,6 +77,7 @@ enum TelegramCommand {
     BeginFillPaths,
     BeginRestore,
     BeginReport,
+    BeginObjections,
     Process {
         label: String,
         input: Option<PathBuf>,
@@ -90,6 +91,9 @@ enum TelegramCommand {
     },
     Report {
         target: String,
+    },
+    Objections {
+        label: String,
     },
     FillPaths {
         field: String,
@@ -112,6 +116,8 @@ enum PendingAction {
     CleanupAuxTemporalConfirm { targets: Vec<PathBuf> },
     Restore,
     Report,
+    ObjectionLabel,
+    ObjectionConfirm { label: String, fingerprint: String },
 }
 
 #[derive(Debug, Default)]
@@ -173,15 +179,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &config,
                         &format!(
                             "Telegram polling detuvo la respuesta tras {} errores consecutivos.\nUltimo error: {}\nEl proceso se detendra para que systemd lo reinicie.",
-                            MAX_CONSECUTIVE_POLL_ERRORS,
-                            err
+                            MAX_CONSECUTIVE_POLL_ERRORS, err
                         ),
                     );
-                    return Err(format!(
-                        "demasiados errores consecutivos de polling: {}",
-                        err
-                    )
-                    .into());
+                    return Err(
+                        format!("demasiados errores consecutivos de polling: {}", err).into(),
+                    );
                 }
                 thread::sleep(Duration::from_secs(RETRY_DELAY_SECONDS));
             }
@@ -191,9 +194,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 pub fn send_operator_notice_from_env(message: &str) -> Result<(), Box<dyn Error>> {
     let config = TelegramConfig::from_env()?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     send_message(&client, &config, message)
 }
 
@@ -440,7 +441,10 @@ fn handle_message(
                 let confirmed = matches!(
                     normalized.as_str(),
                     "BORRAR" | "/BORRAR" | "SI" | "S" | "CONFIRMAR" | "OK"
-                ) || matches!(input_text, "BORRAR" | "borrar" | "Borrar" | "si" | "Si" | "SI");
+                ) || matches!(
+                    input_text,
+                    "BORRAR" | "borrar" | "Borrar" | "si" | "Si" | "SI"
+                );
 
                 if !confirmed {
                     set_pending_action(
@@ -526,6 +530,70 @@ fn handle_message(
                 let report_path = super::report_path_from_target(label)?;
                 send_document(client, config, &report_path, "Reporte HTML generado")
             }
+            PendingAction::ObjectionLabel => {
+                let label = input_text.trim();
+                if let Err(err) = super::validate_backup_label(label) {
+                    set_pending_action(message.chat.id, PendingAction::ObjectionLabel);
+                    send_message(
+                        client,
+                        config,
+                        &format!(
+                            "Etiqueta inválida: {}. Escribe la etiqueta de objeción.",
+                            err
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                begin_objection_preview(client, config, message.chat.id, label)
+            }
+            PendingAction::ObjectionConfirm { label, fingerprint } => {
+                if normalize_command(input_text).eq_ignore_ascii_case("APLICAR") {
+                    send_message(
+                        client,
+                        config,
+                        &format!("Revisando que el plan de {} no haya cambiado...", label),
+                    )?;
+                    match super::confirm_telegram_objection_plan(&label, &fingerprint)? {
+                        super::TelegramObjectionApply::Applied {
+                            summary,
+                            manifest_path,
+                            report_path,
+                        } => {
+                            send_message(client, config, &summary)?;
+                            send_document(
+                                client,
+                                config,
+                                &report_path,
+                                "Registro de archivos antes de unirlos",
+                            )?;
+                            send_document(
+                                client,
+                                config,
+                                &manifest_path,
+                                "Manifiesto con huellas de origen y resultado",
+                            )?;
+                            send_main_menu_message(client, config, "Consolidación finalizada.")
+                        }
+                        super::TelegramObjectionApply::PlanChanged(preview) => {
+                            send_telegram_objection_preview(
+                                client,
+                                config,
+                                message.chat.id,
+                                preview,
+                            )
+                        }
+                    }
+                } else {
+                    set_pending_action(
+                        message.chat.id,
+                        PendingAction::ObjectionConfirm {
+                            label: label.clone(),
+                            fingerprint,
+                        },
+                    );
+                    send_objection_confirmation_prompt(client, config, &label)
+                }
+            }
         };
     }
 
@@ -610,6 +678,14 @@ fn handle_message(
                 "Escribe la etiqueta o la ruta del manifest/respaldo para generar el reporte.",
             )?;
         }
+        TelegramCommand::BeginObjections => {
+            set_pending_action(message.chat.id, PendingAction::ObjectionLabel);
+            send_message(
+                client,
+                config,
+                "Escribe la etiqueta de objeción que quieres revisar, por ejemplo 162158.",
+            )?;
+        }
         TelegramCommand::Process { label, input } => {
             let input_path = input.as_deref().unwrap_or(&config.default_input);
             process_and_reply(client, config, &label, input_path, false)?;
@@ -640,6 +716,10 @@ fn handle_message(
             super::generate_html_report(&target)?;
             let report_path = super::report_path_from_target(&target)?;
             send_document(client, config, &report_path, "Reporte HTML generado")?;
+        }
+        TelegramCommand::Objections { label } => {
+            super::validate_backup_label(&label)?;
+            begin_objection_preview(client, config, message.chat.id, &label)?;
         }
         TelegramCommand::FillPaths { field, value } => {
             if let Some(value) = value {
@@ -679,6 +759,76 @@ fn handle_message(
     }
 
     Ok(())
+}
+
+fn begin_objection_preview(
+    client: &Client,
+    config: &TelegramConfig,
+    chat_id: i64,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    send_message(
+        client,
+        config,
+        &format!("Preparando la vista previa de la objeción {}...", label),
+    )?;
+    let preview = super::prepare_telegram_objection_preview(label)?;
+    send_telegram_objection_preview(client, config, chat_id, preview)
+}
+
+fn send_telegram_objection_preview(
+    client: &Client,
+    config: &TelegramConfig,
+    chat_id: i64,
+    preview: super::TelegramObjectionPreview,
+) -> Result<(), Box<dyn Error>> {
+    let fingerprint_short = &preview.fingerprint[..12.min(preview.fingerprint.len())];
+    send_message(
+        client,
+        config,
+        &format!(
+            "Vista previa de {}: {} grupo(s), {} página(s) de entrada. El CSV adjunto registra los archivos, tamaños, páginas, fechas y SHA-256 antes de unirlos. Revisa el archivo: solo se aplicará este plan si sigue idéntico al confirmar.",
+            preview.label, preview.groups, preview.pages
+        ),
+    )?;
+    send_document(
+        client,
+        config,
+        &preview.report_path,
+        &format!(
+            "Vista previa previa a la unión · {} · {}",
+            preview.label, fingerprint_short
+        ),
+    )?;
+    set_pending_action(
+        chat_id,
+        PendingAction::ObjectionConfirm {
+            label: preview.label.clone(),
+            fingerprint: preview.fingerprint,
+        },
+    );
+    send_objection_confirmation_prompt(client, config, &preview.label)
+}
+
+fn send_objection_confirmation_prompt(
+    client: &Client,
+    config: &TelegramConfig,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    send_message_with_markup(
+        client,
+        config,
+        &format!(
+            "Etiqueta {}: escribe APLICAR para consolidar exactamente lo revisado o Salir para cancelar.",
+            label
+        ),
+        json!({
+            "keyboard": [[{"text": "APLICAR"}], [{"text": "Salir"}]],
+            "resize_keyboard": true,
+            "one_time_keyboard": true,
+            "selective": false
+        }),
+    )
 }
 
 fn process_and_reply(
@@ -871,21 +1021,14 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
             },
             None => TelegramCommand::BeginCleanupAuxTemporal,
         },
-        "/process"
-        | "/procesar"
-        | "PROCESS"
-        | "Process"
-        | "2. Procesar PDFs"
-        | "Procesar PDFs"
-        | "2" => {
-            match parts.next() {
+        "/process" | "/procesar" | "PROCESS" | "Process" | "2. Procesar PDFs" | "Procesar PDFs"
+        | "2" => match parts.next() {
             Some(label) => TelegramCommand::Process {
                 label: label.to_string(),
                 input: parts.next().map(PathBuf::from),
             },
             None => TelegramCommand::BeginProcess,
-        }
-        }
+        },
         "/process_report" | "/process-report" | "/process+report" | "/procesar_reporte" => {
             match parts.next() {
                 Some(label) => TelegramCommand::ProcessReport {
@@ -905,12 +1048,12 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
         | "1. Preparar directorios"
         | "Preparar directorios"
         | "1" => match parts.next() {
-                Some(field) => TelegramCommand::FillPaths {
-                    field: field.to_string(),
-                    value: parts.next().map(|value| value.to_string()),
-                },
-                None => TelegramCommand::BeginFillPaths,
+            Some(field) => TelegramCommand::FillPaths {
+                field: field.to_string(),
+                value: parts.next().map(|value| value.to_string()),
             },
+            None => TelegramCommand::BeginFillPaths,
+        },
         "/restore" | "/restaurar" => match parts.next() {
             Some(target) => TelegramCommand::Restore {
                 target: target.to_string(),
@@ -922,6 +1065,12 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
                 target: target.to_string(),
             },
             None => TelegramCommand::BeginReport,
+        },
+        "/objeciones" | "/consolidar_objeciones" | "/consolidar-objeciones" => match parts.next() {
+            Some(label) => TelegramCommand::Objections {
+                label: label.to_string(),
+            },
+            None => TelegramCommand::BeginObjections,
         },
         "/check" | "/verificar" => {
             let target = parts
@@ -950,7 +1099,8 @@ fn normalize_command(command: &str) -> &str {
 
 fn is_cancel_text(text: &str) -> bool {
     let normalized = normalize_command(text);
-    matches!(normalized, "/exit" | "/salir") || text == "Salir"
+    matches!(normalized, "/exit" | "/salir" | "/cancel")
+        || matches!(text, "Salir" | "Cancelar" | "cancelar")
 }
 
 fn fill_paths_binary_path() -> PathBuf {
@@ -1263,9 +1413,15 @@ fn send_document(
         .and_then(|name| name.to_str())
         .unwrap_or("documento.html")
         .to_string();
+    let mime_type = match path.extension().and_then(|extension| extension.to_str()) {
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("json") => "application/json",
+        Some("html") => "text/html; charset=utf-8",
+        _ => "text/plain; charset=utf-8",
+    };
     let part = multipart::Part::bytes(bytes)
         .file_name(filename)
-        .mime_str("text/html; charset=utf-8")?;
+        .mime_str(mime_type)?;
     let form = multipart::Form::new()
         .text("chat_id", config.chat_id.to_string())
         .text("caption", caption.to_string())
@@ -1348,6 +1504,9 @@ fn send_advanced_menu_message(
                 { "text": "/report" }
             ],
             [
+                { "text": "/objeciones" }
+            ],
+            [
                 { "text": "/restore" },
                 { "text": "Principal" }
             ],
@@ -1385,6 +1544,7 @@ fn help_text() -> String {
         "Mas".to_string(),
         "/process_report <etiqueta> [ruta_input]".to_string(),
         "/report <etiqueta | ruta_manifest_o_respaldo>".to_string(),
+        "/objeciones <etiqueta>".to_string(),
         "/restore <etiqueta | ruta_manifest_o_respaldo>".to_string(),
         "/fp <campo> [valor]".to_string(),
         "/check <etiqueta | ruta_manifest_o_respaldo> <carpeta>".to_string(),
@@ -1400,6 +1560,7 @@ fn help_text() -> String {
         "- El bot envia avances resumidos por carpeta durante el proceso.".to_string(),
         "- El bot solo responde al chat configurado en TELEGRAM_CHAT_ID.".to_string(),
         "- El HTML se envia como archivo adjunto cuando se usa /process_report o /report.".to_string(),
+        "- /objeciones <etiqueta> envia una vista previa con SHA-256 y pide confirmacion antes de aplicar.".to_string(),
         "- /check te dice desde Telegram si una carpeta aparece en el manifest y si conserva el marcador .he1_procesado.".to_string(),
     ]
     .join("\n")
