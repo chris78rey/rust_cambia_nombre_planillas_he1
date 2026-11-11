@@ -1,0 +1,19 @@
+[Unit]
+Description=Rust Cambia Nombre Planillas HE1 - Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data_nuevo/rust_cambia_nombre_planillas_he1
+EnvironmentFile=/data_nuevo/rust_cambia_nombre_planillas_he1/.env
+ExecStartPre=/bin/sh -c 'test -x /data_nuevo/rust_cambia_nombre_planillas_he1/target/release/rust_cambia_nombre_planillas_he1'
+ExecStartPre=/bin/sh -c 'test -r /data_nuevo/rust_cambia_nombre_planillas_he1/.env'
+ExecStart=/data_nuevo/rust_cambia_nombre_planillas_he1/target/release/rust_cambia_nombre_planillas_he1 --telegram
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

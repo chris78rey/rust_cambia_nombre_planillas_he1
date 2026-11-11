@@ -13,6 +13,20 @@ fuentes_txt/*.txt
 fuentes_txt/.he1_respaldo/
 fuentes_txt/_restore_*_manifest.txt
 
+# Configuracion local: .env.ubuntu22.example tambien contiene valores cargados.
+.env*
+!.env.example
+!go_aplicacion/.env.example
+
+# Datos operativos, documentos y artefactos generados/locales.
+*.log
+*.pdf
+*.sqlite
+*.sqlite3
+*.db
+/graphify-out/
+/repomix_rust_clean.txt
+
 # Artefactos locales y logs ad hoc
 repomix-output.xml
 telegram*.log

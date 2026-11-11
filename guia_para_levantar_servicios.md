@@ -90,6 +90,12 @@ Desde la raíz del proyecto:
 cargo build --bin rust_cambia_nombre_planillas_he1
 ```
 
+Si lo quieres dejar como servicio de sistema, compila en release:
+
+```bash
+cargo build --release
+```
+
 ### 6.2 Ejecutar el bot
 
 Luego ejecuta:
@@ -110,6 +116,27 @@ Levantar el servicio significa dejar el bot corriendo para que escuche mensajes 
 
 Si cierras esa terminal, el bot se detiene.
 
+## 6.4 Dejarlo como servicio de sistema
+
+Para que arranque solo despues de reiniciar el host, instala la unidad de systemd incluida en este repo:
+
+```bash
+sudo ./scripts/install_systemd_service.sh
+```
+
+Eso deja el servicio habilitado con arranque automatico y reinicio ante fallos.
+
+Si dentro de meses necesitas recordarlo, consulta tambien `NOTA_OPERACION_TELEGRAM.md` en la raiz del repo.
+
+Comandos utiles:
+
+```bash
+sudo systemctl status rust_cambia_nombre_planillas_he1.service
+sudo systemctl restart rust_cambia_nombre_planillas_he1.service
+sudo systemctl stop rust_cambia_nombre_planillas_he1.service
+sudo journalctl -u rust_cambia_nombre_planillas_he1.service -f
+```
+
 ## 7. Cómo usar el bot
 
 Abre Telegram y escribe:
@@ -120,13 +147,13 @@ Abre Telegram y escribe:
 
 Ahí verás los botones y los comandos disponibles.
 
-### 7.1 Botón `FP`
+### 7.1 Botón `1. Preparar directorios`
 
-`FP` sirve para llenar `fuentes_txt/PATH_DIRECTORIOS.txt`.
+`1. Preparar directorios` sirve para llenar `fuentes_txt/PATH_DIRECTORIOS.txt`.
 
 Flujo:
 
-1. Toca `FP`.
+1. Toca `1. Preparar directorios`.
 2. Elige el campo Oracle.
 3. Escribe el valor.
 4. El bot llena el archivo `PATH_DIRECTORIOS.txt`.
@@ -149,7 +176,9 @@ Para procesar, puedes usar:
 - `/process`
 - `/process_report`
 
-El bot te pedirá la etiqueta.
+Si tocas `2. Procesar PDFs` sin escribir nada, el bot genera automaticamente una etiqueta tipo `202607282036` para no obligarte a escribirla.
+
+El bot te pedirá la etiqueta solo si la escribes manualmente junto al comando.
 
 Ejemplo:
 
@@ -204,8 +233,7 @@ Si solo quieres usar el sistema, haz esto:
 
 1. Levanta el bot con `./target/debug/rust_cambia_nombre_planillas_he1 --telegram`
 2. En Telegram manda `/help`
-3. Usa `FP` para llenar `PATH_DIRECTORIOS.txt`
-4. Usa `/process` o `/process_report` con la etiqueta
+3. Usa `1. Preparar directorios` para llenar `PATH_DIRECTORIOS.txt`
+4. Usa `2. Procesar PDFs` con la etiqueta
 
 Si quieres revertir una corrida, usa `/restore`.
-

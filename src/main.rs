@@ -67,18 +67,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             err
         );
     }
-    match parse_args()? {
+    let mode = parse_args()?;
+    let result = match &mode {
         AppMode::Help => {
             print_usage();
             Ok(())
         }
-        AppMode::Restore(target) => restore_from_backup(&target),
-        AppMode::Report(target) => generate_html_report(&target),
-        AppMode::Check { target, folder } => verify_folder_processed(&target, &folder),
-        AppMode::ConvertPaths { input, output } => convert_directory_list_paths(&input, &output),
+        AppMode::Restore(target) => restore_from_backup(target),
+        AppMode::Report(target) => generate_html_report(target),
+        AppMode::Check { target, folder } => verify_folder_processed(target, folder),
+        AppMode::ConvertPaths { input, output } => convert_directory_list_paths(input, output),
         AppMode::Telegram => telegram::run(),
-        AppMode::Process { input, label } => run_process_mode(&input, &label, None),
+        AppMode::Process { input, label } => run_process_mode(input, label, None),
+    };
+
+    if let Err(err) = &result {
+        eprintln!("error de ejecucion: {}", err);
+        if matches!(mode, AppMode::Telegram) {
+            let _ = telegram::send_operator_notice_from_env(&format!(
+                "Bot de Telegram detenido con error:\n{}",
+                err
+            ));
+        }
     }
+
+    result
 }
 
 fn parse_args() -> Result<AppMode, Box<dyn std::error::Error>> {
@@ -902,6 +915,13 @@ fn timestamp_now() -> String {
 
 const ECUADOR_OFFSET_SECONDS: i64 = -5 * 3600;
 
+pub fn auto_process_label() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(dur) => format_unix_compact_with_offset(dur.as_secs() as i64, ECUADOR_OFFSET_SECONDS),
+        Err(_) => "000000000000".to_string(),
+    }
+}
+
 fn timestamp_to_ecuador(timestamp: &str) -> Option<String> {
     let unix_seconds = timestamp.parse::<i64>().ok()?;
     Some(format_unix_seconds_with_offset(
@@ -954,6 +974,17 @@ fn format_unix_seconds_with_offset(unix_seconds: i64, offset_seconds: i64) -> St
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, day, hour, minute, second
     )
+}
+
+fn format_unix_compact_with_offset(unix_seconds: i64, offset_seconds: i64) -> String {
+    let local_seconds = unix_seconds + offset_seconds;
+    let days = local_seconds.div_euclid(86_400);
+    let seconds_of_day = local_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+
+    format!("{:04}{:02}{:02}{:02}{:02}", year, month, day, hour, minute)
 }
 
 fn civil_from_days(days: i64) -> (i64, u32, u32) {

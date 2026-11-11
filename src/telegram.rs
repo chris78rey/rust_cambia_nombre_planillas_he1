@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 const POLL_TIMEOUT_SECONDS: u64 = 30;
 const RETRY_DELAY_SECONDS: u64 = 5;
 const BACKUP_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
+const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 12;
 
 #[derive(Debug, Clone)]
 struct TelegramConfig {
@@ -69,7 +70,9 @@ struct Chat {
 enum TelegramCommand {
     Help,
     Exit,
+    ShowAdvancedMenu,
     BeginProcess,
+    BeginCleanupAuxTemporal,
     BeginProcessReport,
     BeginFillPaths,
     BeginRestore,
@@ -92,6 +95,9 @@ enum TelegramCommand {
         field: String,
         value: Option<String>,
     },
+    CleanupAuxTemporal {
+        input: Option<PathBuf>,
+    },
     Check {
         target: String,
         folder: PathBuf,
@@ -101,11 +107,18 @@ enum TelegramCommand {
 
 #[derive(Debug, Clone)]
 enum PendingAction {
-    Process { with_report: bool },
     FillPathsField,
     FillPathsValue { field: String },
+    CleanupAuxTemporalConfirm { targets: Vec<PathBuf> },
     Restore,
     Report,
+}
+
+#[derive(Debug, Default)]
+struct CleanupResult {
+    deleted: usize,
+    missing: usize,
+    errors: usize,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -114,6 +127,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .timeout(Duration::from_secs(120))
         .build()?;
     let mut offset: i64 = 0;
+    let mut consecutive_poll_errors: u32 = 0;
     let _cleanup_worker = BackupCleanupWorker::start();
 
     eprintln!(
@@ -121,10 +135,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         config.chat_id,
         config.default_input.display()
     );
+    let _ = send_message(
+        &client,
+        &config,
+        &format!(
+            "Bot de Telegram iniciado correctamente.\nEntrada por defecto: {}",
+            config.default_input.display()
+        ),
+    );
 
     loop {
         match get_updates(&client, &config, offset) {
             Ok(updates) => {
+                consecutive_poll_errors = 0;
                 for update in updates {
                     offset = update.update_id + 1;
                     if let Some(message) = update.message {
@@ -143,10 +166,35 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
             Err(err) => {
                 eprintln!("telegram polling error: {}", err);
+                consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
+                if consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                    let _ = send_message(
+                        &client,
+                        &config,
+                        &format!(
+                            "Telegram polling detuvo la respuesta tras {} errores consecutivos.\nUltimo error: {}\nEl proceso se detendra para que systemd lo reinicie.",
+                            MAX_CONSECUTIVE_POLL_ERRORS,
+                            err
+                        ),
+                    );
+                    return Err(format!(
+                        "demasiados errores consecutivos de polling: {}",
+                        err
+                    )
+                    .into());
+                }
                 thread::sleep(Duration::from_secs(RETRY_DELAY_SECONDS));
             }
         }
     }
+}
+
+pub fn send_operator_notice_from_env(message: &str) -> Result<(), Box<dyn Error>> {
+    let config = TelegramConfig::from_env()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    send_message(&client, &config, message)
 }
 
 impl TelegramConfig {
@@ -303,48 +351,34 @@ fn handle_message(
     let Some(text) = message.text.as_deref() else {
         return Ok(());
     };
+    let input_text = text.trim();
+
+    if matches!(normalize_command(input_text), "/start" | "/help" | "/ayuda") {
+        clear_pending_action(message.chat.id);
+        send_main_menu_message(
+            client,
+            config,
+            "Flujo principal: 1. Preparar directorios -> 2. Procesar PDFs. La limpieza de .he1_aux_temporal ocurre al terminar el paso 2.",
+        )?;
+        return Ok(());
+    }
+
+    if is_cancel_text(input_text) {
+        clear_pending_action(message.chat.id);
+        send_message_with_markup(
+            client,
+            config,
+            "Operacion cancelada. Escribe /help para mostrar el menu otra vez.",
+            json!({
+                "remove_keyboard": true,
+                "selective": false
+            }),
+        )?;
+        return Ok(());
+    }
 
     if let Some(action) = take_pending_action(message.chat.id) {
-        let input_text = text.trim();
-        if is_cancel_text(input_text) {
-            clear_pending_action(message.chat.id);
-            send_message_with_markup(
-                client,
-                config,
-                "Operacion cancelada. Escribe /help para mostrar el menu otra vez.",
-                json!({
-                    "remove_keyboard": true,
-                    "selective": false
-                }),
-            )?;
-            return Ok(());
-        }
-
         return match action {
-            PendingAction::Process { with_report } => {
-                let label = input_text;
-                if label.is_empty() {
-                    send_menu_message(
-                        client,
-                        config,
-                        "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
-                    )?;
-                    set_pending_action(message.chat.id, PendingAction::Process { with_report });
-                    return Ok(());
-                }
-
-                let input_path = &config.default_input;
-                send_message(
-                    client,
-                    config,
-                    &format!(
-                        "Procesando etiqueta {} con {}\nTe avisare cada 30 segundos mientras siga corriendo.",
-                        label,
-                        input_path.display()
-                    ),
-                )?;
-                process_and_reply(client, config, label, input_path, with_report)
-            }
             PendingAction::FillPathsField => {
                 let field = input_text;
                 if field.is_empty() {
@@ -401,10 +435,58 @@ fn handle_message(
 
                 fill_paths_from_telegram(client, config, &field, value)
             }
+            PendingAction::CleanupAuxTemporalConfirm { targets } => {
+                let normalized = normalize_command(input_text).to_ascii_uppercase();
+                let confirmed = matches!(
+                    normalized.as_str(),
+                    "BORRAR" | "/BORRAR" | "SI" | "S" | "CONFIRMAR" | "OK"
+                ) || matches!(input_text, "BORRAR" | "borrar" | "Borrar" | "si" | "Si" | "SI");
+
+                if !confirmed {
+                    set_pending_action(
+                        message.chat.id,
+                        PendingAction::CleanupAuxTemporalConfirm { targets },
+                    );
+                    send_message(
+                        client,
+                        config,
+                        "Escribe BORRAR para confirmar la limpieza o Salir para cancelar.",
+                    )?;
+                    return Ok(());
+                }
+
+                let mut deleted = 0usize;
+                let mut missing = 0usize;
+                let mut errors = 0usize;
+
+                for target in targets {
+                    if !target.exists() {
+                        missing += 1;
+                        continue;
+                    }
+
+                    match fs::remove_dir_all(&target) {
+                        Ok(_) => deleted += 1,
+                        Err(err) => {
+                            errors += 1;
+                            eprintln!("error al borrar {}: {}", target.display(), err);
+                        }
+                    }
+                }
+
+                send_main_menu_message(
+                    client,
+                    config,
+                    &format!(
+                        "Limpieza manual terminada.\nBorradas: {}\nNo encontradas: {}\nErrores: {}.",
+                        deleted, missing, errors
+                    ),
+                )
+            }
             PendingAction::Restore => {
                 let label = input_text;
                 if label.is_empty() {
-                    send_menu_message(
+                    send_main_menu_message(
                         client,
                         config,
                         "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
@@ -427,7 +509,7 @@ fn handle_message(
             PendingAction::Report => {
                 let label = input_text;
                 if label.is_empty() {
-                    send_menu_message(
+                    send_main_menu_message(
                         client,
                         config,
                         "La etiqueta no puede estar vacia. Escribe una etiqueta valida.",
@@ -450,7 +532,11 @@ fn handle_message(
     let command = parse_command(text)?;
     match command {
         TelegramCommand::Help => {
-            send_menu_message(client, config, &help_text())?;
+            send_main_menu_message(
+                client,
+                config,
+                "Flujo principal: 1. Preparar directorios -> 2. Procesar PDFs. La limpieza de .he1_aux_temporal ocurre al terminar el paso 2.",
+            )?;
         }
         TelegramCommand::Exit => {
             clear_pending_action(message.chat.id);
@@ -464,27 +550,41 @@ fn handle_message(
                 }),
             )?;
         }
-        TelegramCommand::BeginProcess => {
-            set_pending_action(
-                message.chat.id,
-                PendingAction::Process { with_report: false },
-            );
-            send_message(
+        TelegramCommand::ShowAdvancedMenu => {
+            send_advanced_menu_message(
                 client,
                 config,
-                "Escribe la etiqueta que quieres procesar. Ejemplo: PATH_DIRECTORIOS",
+                "Menu avanzado. Usa estos comandos solo cuando salgas del flujo principal.",
             )?;
         }
-        TelegramCommand::BeginProcessReport => {
-            set_pending_action(
-                message.chat.id,
-                PendingAction::Process { with_report: true },
-            );
+        TelegramCommand::BeginProcess => {
+            let label = super::auto_process_label();
             send_message(
                 client,
                 config,
-                "Escribe la etiqueta para procesar y generar reporte. Ejemplo: PATH_DIRECTORIOS",
+                &format!(
+                    "Usare la etiqueta automatica: {}\nProcesando con la entrada por defecto.",
+                    label
+                ),
             )?;
+            let input_path = &config.default_input;
+            process_and_reply(client, config, &label, input_path, false)?;
+        }
+        TelegramCommand::BeginCleanupAuxTemporal => {
+            begin_cleanup_aux_temporal(client, config, &config.default_input)?;
+        }
+        TelegramCommand::BeginProcessReport => {
+            let label = super::auto_process_label();
+            send_message(
+                client,
+                config,
+                &format!(
+                    "Usare la etiqueta automatica: {}\nProcesando con reporte y la entrada por defecto.",
+                    label
+                ),
+            )?;
+            let input_path = &config.default_input;
+            process_and_reply(client, config, &label, input_path, true)?;
         }
         TelegramCommand::BeginFillPaths => {
             set_pending_action(message.chat.id, PendingAction::FillPathsField);
@@ -561,6 +661,10 @@ fn handle_message(
                 )?;
             }
         }
+        TelegramCommand::CleanupAuxTemporal { input } => {
+            let input_path = input.as_deref().unwrap_or(&config.default_input);
+            begin_cleanup_aux_temporal(client, config, input_path)?;
+        }
         TelegramCommand::Check { target, folder } => {
             let report = super::build_folder_verification_report(&target, &folder)?;
             send_message(client, config, &report)?;
@@ -607,6 +711,8 @@ fn process_and_reply(
     let process_result = super::run_process_mode(input, label, Some(&progress_tracker));
     drop(heartbeat);
     process_result?;
+
+    let cleanup_result = cleanup_aux_temporal_after_process(client, config, input)?;
 
     let manifest_path = super::manifest_path_from_target(label)?;
     let manifest = super::read_manifest(&manifest_path)?;
@@ -702,6 +808,14 @@ fn process_and_reply(
     );
 
     send_message(client, config, &summary)?;
+    send_message(
+        client,
+        config,
+        &format!(
+            "Limpieza automatica de .he1_aux_temporal: borradas={}, no_encontradas={}, errores={}",
+            cleanup_result.deleted, cleanup_result.missing, cleanup_result.errors
+        ),
+    )?;
 
     if with_report {
         super::generate_html_report(label)?;
@@ -718,7 +832,21 @@ fn process_and_reply(
 }
 
 fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
-    let mut parts = text.split_whitespace();
+    let trimmed = text.trim();
+    match trimmed {
+        "1. Preparar directorios" | "Preparar directorios" | "1" => {
+            return Ok(TelegramCommand::BeginFillPaths);
+        }
+        "2. Procesar PDFs" | "Procesar PDFs" | "2" => {
+            return Ok(TelegramCommand::BeginProcess);
+        }
+        "Principal" | "Menu" | "MENÚ" | "Menu principal" | "Menú principal" => {
+            return Ok(TelegramCommand::Help);
+        }
+        _ => {}
+    }
+
+    let mut parts = trimmed.split_whitespace();
     let Some(raw_command) = parts.next() else {
         return Err("mensaje vacio".into());
     };
@@ -727,13 +855,37 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
     let parsed = match command {
         "/start" | "/help" | "/ayuda" => TelegramCommand::Help,
         "/exit" | "/salir" | "Salir" => TelegramCommand::Exit,
-        "/process" | "/procesar" => match parts.next() {
+        "/mas" | "Mas" | "MAS" | "/avanzado" | "Avanzado" | "MENU" => {
+            TelegramCommand::ShowAdvancedMenu
+        }
+        "/cleanup_temp"
+        | "/cleanup-temporal"
+        | "/limpiar_temporales"
+        | "/limpiar_temporal"
+        | "/limpiar"
+        | "3. Limpiar temporales"
+        | "Limpiar temporales"
+        | "3" => match parts.next() {
+            Some(input) => TelegramCommand::CleanupAuxTemporal {
+                input: Some(PathBuf::from(input)),
+            },
+            None => TelegramCommand::BeginCleanupAuxTemporal,
+        },
+        "/process"
+        | "/procesar"
+        | "PROCESS"
+        | "Process"
+        | "2. Procesar PDFs"
+        | "Procesar PDFs"
+        | "2" => {
+            match parts.next() {
             Some(label) => TelegramCommand::Process {
                 label: label.to_string(),
                 input: parts.next().map(PathBuf::from),
             },
             None => TelegramCommand::BeginProcess,
-        },
+        }
+        }
         "/process_report" | "/process-report" | "/process+report" | "/procesar_reporte" => {
             match parts.next() {
                 Some(label) => TelegramCommand::ProcessReport {
@@ -743,15 +895,22 @@ fn parse_command(text: &str) -> Result<TelegramCommand, Box<dyn Error>> {
                 None => TelegramCommand::BeginProcessReport,
             }
         }
-        "/fp" | "/fill_paths" | "/fill-paths" | "/llenar_paths" | "/llenar" | "fp" | "FP" => {
-            match parts.next() {
+        "/fp"
+        | "/fill_paths"
+        | "/fill-paths"
+        | "/llenar_paths"
+        | "/llenar"
+        | "fp"
+        | "FP"
+        | "1. Preparar directorios"
+        | "Preparar directorios"
+        | "1" => match parts.next() {
                 Some(field) => TelegramCommand::FillPaths {
                     field: field.to_string(),
                     value: parts.next().map(|value| value.to_string()),
                 },
                 None => TelegramCommand::BeginFillPaths,
-            }
-        }
+            },
         "/restore" | "/restaurar" => match parts.next() {
             Some(target) => TelegramCommand::Restore {
                 target: target.to_string(),
@@ -896,7 +1055,123 @@ fn fill_paths_from_telegram(
     ));
 
     send_message(client, config, &summary)?;
+    send_main_menu_message(
+        client,
+        config,
+        "Directorio preparado. Siguiente paso recomendado: 2. Procesar PDFs con la etiqueta que ya tengas definida. La limpieza queda para el paso 3.",
+    )?;
     Ok(())
+}
+
+fn begin_cleanup_aux_temporal(
+    client: &Client,
+    config: &TelegramConfig,
+    input_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let targets = collect_cleanup_aux_temporal_targets(input_path)?;
+
+    if targets.is_empty() {
+        send_main_menu_message(
+            client,
+            config,
+            &format!(
+                "No encontre carpetas con .he1_aux_temporal dentro de {}.\nPuedes seguir con 2. Procesar PDFs.",
+                input_path.display()
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let preview = targets
+        .iter()
+        .take(8)
+        .map(|path| format!("- {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    send_message(
+        client,
+        config,
+        &format!(
+            "Encontradas {} carpetas para limpiar.\nSolo se borrara el hijo exacto .he1_aux_temporal dentro de cada ruta.\n\nEjemplos:\n{}\n\nEscribe BORRAR para confirmar o Salir para cancelar.",
+            targets.len(),
+            preview
+        ),
+    )?;
+    set_pending_action(
+        config.chat_id,
+        PendingAction::CleanupAuxTemporalConfirm { targets },
+    );
+    Ok(())
+}
+
+fn collect_cleanup_aux_temporal_targets(input_path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let content = fs::read_to_string(input_path)?;
+    let mut targets = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let base = PathBuf::from(line);
+        if base.file_name().and_then(|name| name.to_str()) == Some(".he1_aux_temporal") {
+            continue;
+        }
+
+        let target = base.join(".he1_aux_temporal");
+        if target.is_dir() {
+            targets.push(target);
+        }
+    }
+
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+fn cleanup_aux_temporal_after_process(
+    client: &Client,
+    config: &TelegramConfig,
+    input_path: &Path,
+) -> Result<CleanupResult, Box<dyn Error>> {
+    let targets = collect_cleanup_aux_temporal_targets(input_path)?;
+    if targets.is_empty() {
+        return Ok(CleanupResult::default());
+    }
+
+    let result = remove_cleanup_aux_temporal_targets(targets);
+    send_message(
+        client,
+        config,
+        &format!(
+            "Limpieza automatica de .he1_aux_temporal terminada.\nBorradas: {}\nNo encontradas: {}\nErrores: {}",
+            result.deleted, result.missing, result.errors
+        ),
+    )?;
+    Ok(result)
+}
+
+fn remove_cleanup_aux_temporal_targets(targets: Vec<PathBuf>) -> CleanupResult {
+    let mut result = CleanupResult::default();
+
+    for target in targets {
+        if !target.exists() {
+            result.missing += 1;
+            continue;
+        }
+
+        match fs::remove_dir_all(&target) {
+            Ok(_) => result.deleted += 1,
+            Err(err) => {
+                result.errors += 1;
+                eprintln!("error al borrar {}: {}", target.display(), err);
+            }
+        }
+    }
+
+    result
 }
 
 fn send_fill_paths_field_menu(
@@ -1023,7 +1298,7 @@ fn decode_telegram_response<T>(payload: TelegramResponse<T>) -> Result<T, Box<dy
     }
 }
 
-fn send_menu_message(
+fn send_main_menu_message(
     client: &Client,
     config: &TelegramConfig,
     text: &str,
@@ -1031,17 +1306,11 @@ fn send_menu_message(
     let reply_markup = json!({
         "keyboard": [
             [
-                { "text": "/process" },
-                { "text": "/process_report" }
+                { "text": "1. Preparar directorios" },
+                { "text": "2. Procesar PDFs" }
             ],
             [
-                { "text": "/report" },
-                { "text": "/restore" }
-            ],
-            [
-                { "text": "FP" }
-            ],
-            [
+                { "text": "Mas" },
                 { "text": "/help" }
             ],
             [
@@ -1067,22 +1336,65 @@ fn send_menu_message(
     Ok(())
 }
 
+fn send_advanced_menu_message(
+    client: &Client,
+    config: &TelegramConfig,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
+    let reply_markup = json!({
+        "keyboard": [
+            [
+                { "text": "/process_report" },
+                { "text": "/report" }
+            ],
+            [
+                { "text": "/restore" },
+                { "text": "Principal" }
+            ],
+            [
+                { "text": "/help" },
+                { "text": "Salir" }
+            ]
+        ],
+        "resize_keyboard": true,
+        "one_time_keyboard": false,
+        "selective": false
+    });
+
+    let response = client
+        .post(config.api_url("sendMessage"))
+        .form(&[
+            ("chat_id", config.chat_id.to_string()),
+            ("text", text.to_string()),
+            ("reply_markup", reply_markup.to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+    let payload: TelegramResponse<serde_json::Value> = response.json()?;
+    let _ = decode_telegram_response(payload)?;
+    Ok(())
+}
+
 fn help_text() -> String {
     vec![
-        "Botones rapidos: /process, /process_report, /report, /restore, /fp".to_string(),
+        "Flujo principal: 1. Preparar directorios -> 2. Procesar PDFs".to_string(),
         String::new(),
         "Comandos disponibles:".to_string(),
-        "/process <etiqueta> [ruta_input]".to_string(),
+        "1. Preparar directorios".to_string(),
+        "2. Procesar PDFs <etiqueta> [ruta_input]".to_string(),
+        "Mas".to_string(),
         "/process_report <etiqueta> [ruta_input]".to_string(),
-        "/restore <etiqueta | ruta_manifest_o_respaldo>".to_string(),
         "/report <etiqueta | ruta_manifest_o_respaldo>".to_string(),
+        "/restore <etiqueta | ruta_manifest_o_respaldo>".to_string(),
         "/fp <campo> [valor]".to_string(),
         "/check <etiqueta | ruta_manifest_o_respaldo> <carpeta>".to_string(),
         "/help".to_string(),
         "".to_string(),
         "Notas:".to_string(),
-        "- Si tocas un boton, el bot te pedira la etiqueta o el campo antes de ejecutar.".to_string(),
-        "- /process y /process_report usan HE1_INPUT si no indicas otra ruta.".to_string(),
+        "- El orden normal es: 1. Preparar directorios y luego 2. Procesar PDFs.".to_string(),
+        "- Al terminar el paso 2, el bot limpia automaticamente los .he1_aux_temporal del listado generado por Go.".to_string(),
+        "- Si tocas 2. Procesar PDFs sin escribir nada, el bot genera una etiqueta automatica tipo 202607282036.".to_string(),
+        "- /process usa HE1_INPUT si no indicas otra ruta.".to_string(),
         "- /fp llena PATH_DIRECTORIOS.txt usando Oracle y SQLite desde este equipo.".to_string(),
         "- /fp te deja elegir el campo Oracle y luego escribir el valor de filtro.".to_string(),
         "- El bot envia avances resumidos por carpeta durante el proceso.".to_string(),
